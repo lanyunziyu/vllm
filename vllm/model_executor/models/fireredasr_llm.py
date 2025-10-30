@@ -1,0 +1,1758 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Inference-only FireRedASR LLM model compatible with HuggingFace weights."""
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Annotated, Any, Literal, Optional, Union
+
+import torch
+import torch.nn as nn
+import numpy as np
+from transformers import BatchFeature
+
+from vllm.config import VllmConfig
+from vllm.config.speech_to_text import SpeechToTextConfig
+from vllm.config import ModelConfig
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.config.multimodal import BaseDummyOptions
+from vllm.multimodal.inputs import (AudioItem, ModalityData,
+                                    MultiModalDataDict, MultiModalFieldConfig,
+                                    MultiModalKwargsItems)
+from vllm.multimodal.parse import (AudioProcessorItems, DictEmbeddingItems,
+                                   ModalityDataItems, MultiModalDataItems,
+                                   MultiModalDataParser)
+from vllm.multimodal.processing import (BaseMultiModalProcessor,
+                                        EncDecMultiModalProcessor,
+                                        BaseProcessingInfo, PromptReplacement,
+                                        PromptUpdate, PromptUpdateDetails,
+                                        PromptIndexTargets)
+from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.sequence import IntermediateTensors
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
+
+from .interfaces import SupportsTranscription, SupportsMultiModal, SupportsPP, MultiModalEmbeddings
+from .utils import merge_multimodal_embeddings
+from .interfaces_base import VllmModelForTextGeneration
+from .utils import (AutoWeightsLoader, init_vllm_registered_model,
+                    maybe_prefix)
+import os
+
+
+def _load_firered_llm_weights(model_path: str, encoder_path: str = None):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+    # Load main model checkpoint
+    package = torch.load(model_path, map_location=lambda storage, loc: storage,weights_only=False)
+    model_state_dict = package.get("model_state_dict", {})
+    args = package.get("args", None)
+
+    # Load encoder checkpoint if provided
+    encoder_state_dict = {}
+    if encoder_path and os.path.exists(encoder_path):
+        encoder_package = torch.load(encoder_path, map_location=lambda storage, loc: storage,weights_only=False)
+        encoder_state_dict = encoder_package.get("model_state_dict", {})
+
+    return model_state_dict, encoder_state_dict, args
+
+
+# === Audio Inputs === #
+class FireRedASRFeatureInputs(TensorSchema):
+    type: Literal["audio_features"]
+    input_features: Annotated[
+        Union[torch.Tensor, list[torch.Tensor]],
+        TensorShape("na", "nf", "nt"),
+    ]
+
+    feature_lengths: Annotated[
+        torch.Tensor,
+        TensorShape("na"),
+    ]
+
+
+class FireRedASREmbeddingInputs(TensorSchema):
+    type: Literal["audio_embeds"] = "audio_embeds"
+
+    audio_embeds: Annotated[
+        list[torch.Tensor],
+        TensorShape("bn", "naf", "hs"),
+    ]
+
+
+FireRedASRInputs = Union[FireRedASRFeatureInputs, FireRedASREmbeddingInputs]
+
+# === Encoder Components === #
+class Swish(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
+class Conv2dSubsampling(nn.Module):
+    def __init__(self, idim: int, d_model: int, out_channels: int = 32):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, out_channels, 3, 2),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, 3, 2),
+            nn.ReLU(),
+        )
+        subsample_idim = ((idim - 1) // 2 - 1) // 2
+        self.out = nn.Linear(out_channels * subsample_idim, d_model)
+        self.subsampling = 4
+        left_context = right_context = 3
+        self.context = left_context + 1 + right_context  # 7
+
+    def forward(self, x: torch.Tensor, x_mask: torch.Tensor):
+        x = x.unsqueeze(1)
+        x = self.conv(x)
+        N, C, T, D = x.size()
+        x = self.out(x.transpose(1, 2).contiguous().view(N, T, C * D))
+        mask = x_mask[:, :, :-2:2][:, :, :-2:2]
+        input_lengths = mask[:, -1, :].sum(dim=-1)
+        return x, input_lengths, mask
+
+
+class RelPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        pe_positive = torch.zeros(max_len, d_model, requires_grad=False)
+        pe_negative = torch.zeros(max_len, d_model, requires_grad=False)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe_positive[:, 0::2] = torch.sin(position * div_term)
+        pe_positive[:, 1::2] = torch.cos(position * div_term)
+        pe_negative[:, 0::2] = torch.sin(-position * div_term)
+        pe_negative[:, 1::2] = torch.cos(-position * div_term)
+        self.pe_positive = pe_positive.unsqueeze(0)
+        self.pe_negative = pe_negative.unsqueeze(0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.size(1)
+        pe = self.pe_positive[:, :T, :].to(x.device, dtype=x.dtype)
+        return pe
+
+
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self, temperature: float):
+        super().__init__()
+        self.temperature = temperature
+        self.dropout = nn.Dropout(0.0)
+        self.INF = float('inf')
+
+    def forward(self, q, k, v, mask=None):
+        attn = torch.matmul(q, k.transpose(2, 3)) / self.temperature
+        if mask is not None:
+            mask = mask.unsqueeze(1).eq(0)
+            attn = attn.masked_fill(mask, -self.INF)
+            attn = torch.softmax(attn, dim=-1).masked_fill(mask, 0.0)
+        else:
+            attn = torch.softmax(attn, dim=-1)
+        d_attn = self.dropout(attn)
+        output = torch.matmul(d_attn, v)
+        return output, attn
+
+
+class EncoderMultiHeadAttention(nn.Module):
+    def __init__(self, n_head: int, d_model: int, residual_dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.d_k = d_model // n_head
+        self.d_v = self.d_k
+        self.w_qs = nn.Linear(d_model, n_head * self.d_k, bias=False)
+        self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
+        self.w_vs = nn.Linear(d_model, n_head * self.d_v, bias=False)
+        self.layer_norm_q = nn.LayerNorm(d_model)
+        self.layer_norm_k = nn.LayerNorm(d_model)
+        self.layer_norm_v = nn.LayerNorm(d_model)
+        self.attention = ScaledDotProductAttention(temperature=self.d_k ** 0.5)
+        self.fc = nn.Linear(n_head * self.d_v, d_model, bias=False)
+        self.dropout = nn.Dropout(residual_dropout)
+
+    def forward(self, q, k, v, mask=None):
+        sz_b, len_q = q.size(0), q.size(1)
+        residual = q
+        q, k, v = self.forward_qkv(q, k, v)
+        output, attn = self.attention(q, k, v, mask=mask)
+        output = self.forward_output(output, residual, sz_b, len_q)
+        return output, attn
+
+    def forward_qkv(self, q, k, v):
+        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
+        sz_b, len_q = q.size(0), q.size(1)
+        q = self.layer_norm_q(q)
+        k = self.layer_norm_k(k)
+        v = self.layer_norm_v(v)
+        q = self.w_qs(q).view(sz_b, len_q, n_head, d_k).transpose(1, 2)
+        k = self.w_ks(k).view(sz_b, k.size(1), n_head, d_k).transpose(1, 2)
+        v = self.w_vs(v).view(sz_b, v.size(1), n_head, self.d_v).transpose(1, 2)
+        return q, k, v
+
+    def forward_output(self, output, residual, sz_b, len_q):
+        output = output.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
+        fc_out = self.fc(output)
+        output = self.dropout(fc_out)
+        output = output + residual
+        return output
+
+
+class RelPosMultiHeadAttention(EncoderMultiHeadAttention):
+    def __init__(self, n_head: int, d_model: int, residual_dropout: float = 0.1):
+        super().__init__(n_head, d_model, residual_dropout)
+        d_k = d_model // n_head
+        self.scale = 1.0 / (d_k ** 0.5)
+        self.linear_pos = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.pos_bias_u = nn.Parameter(torch.FloatTensor(n_head, d_k))
+        self.pos_bias_v = nn.Parameter(torch.FloatTensor(n_head, d_k))
+        torch.nn.init.xavier_uniform_(self.pos_bias_u)
+        torch.nn.init.xavier_uniform_(self.pos_bias_v)
+
+    def _rel_shift(self, x):
+        N, H, T1, T2 = x.size()
+        zero_pad = torch.zeros((N, H, T1, 1), device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([zero_pad, x], dim=-1)
+        x_padded = x_padded.view(N, H, T2 + 1, T1)
+        x = x_padded[:, :, 1:].view_as(x)
+        x = x[:, :, :, : x.size(-1) // 2 + 1]
+        return x
+
+    def forward(self, q, k, v, pos_emb, mask=None):
+        sz_b, len_q = q.size(0), q.size(1)
+        residual = q
+        q, k, v = self.forward_qkv(q, k, v)
+        # Compute scaled dot-product attention in head space without extra transposes
+        output, attn = self.attention(q, k, v, mask=mask)
+        # Project back to (B, T, d_model) and add residual (matches base class)
+        output = self.forward_output(output, residual, sz_b, len_q)
+        return output, attn
+
+
+class ConformerConvolution(nn.Module):
+    def __init__(self, d_model: int, kernel_size: int = 33, dropout_rate: float = 0.1):
+        super().__init__()
+        assert kernel_size % 2 == 1
+        self.pre_layer_norm = nn.LayerNorm(d_model)
+        self.pointwise_conv1 = nn.Conv1d(d_model, d_model * 4, kernel_size=1, bias=False)
+        self.glu = nn.functional.glu
+        self.padding = (kernel_size - 1) // 2
+        self.depthwise_conv = nn.Conv1d(
+            d_model * 2, d_model * 2, kernel_size, stride=1, padding=self.padding, groups=d_model * 2, bias=False
+        )
+        self.batch_norm = nn.LayerNorm(d_model * 2)
+        self.swish = Swish()
+        self.pointwise_conv2 = nn.Conv1d(d_model * 2, d_model, kernel_size=1, bias=False)
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, mask=None):
+        residual = x
+        out = self.pre_layer_norm(x).transpose(1, 2)
+        if mask is not None:
+            out.masked_fill_(mask.ne(1), 0.0)
+        out = self.pointwise_conv1(out)
+        out = self.glu(out, dim=1)
+        out = self.depthwise_conv(out)
+        out = out.transpose(1, 2)
+        out = self.swish(self.batch_norm(out))
+        out = out.transpose(1, 2)
+        out = self.dropout(self.pointwise_conv2(out))
+        if mask is not None:
+            out.masked_fill_(mask.ne(1), 0.0)
+        out = out.transpose(1, 2)
+        return out + residual
+
+
+class ConformerFeedForward(nn.Module):
+    def __init__(self, d_model: int, dropout_post: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 4),
+            Swish(),
+            nn.Dropout(dropout_post),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout_post),
+        )
+
+    def forward(self, x):
+        residual = x
+        output = self.net(x)
+        return output + residual
+
+
+class RelPosEmbConformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int, residual_dropout: float = 0.1, dropout_rate: float = 0.1, kernel_size: int = 33):
+        super().__init__()
+        self.ffn1 = ConformerFeedForward(d_model, dropout_rate)
+        self.mhsa = RelPosMultiHeadAttention(n_head, d_model, residual_dropout)
+        self.conv = ConformerConvolution(d_model, kernel_size, dropout_rate)
+        self.ffn2 = ConformerFeedForward(d_model, dropout_rate)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, pos_emb, slf_attn_mask=None, pad_mask=None):
+        out = 0.5 * x + 0.5 * self.ffn1(x)
+        out = self.mhsa(out, out, out, pos_emb, mask=slf_attn_mask)[0]
+        out = self.conv(out, pad_mask)
+        out = 0.5 * out + 0.5 * self.ffn2(out)
+        out = self.layer_norm(out)
+        return out
+
+
+class ConformerEncoder(nn.Module):
+    """FireRedASR ConformerEncoder aligned to reference implementation."""
+
+    def __init__(self, input_size: int, num_blocks: int, n_head: int, d_model: int,
+                 residual_dropout: float = 0.1, dropout_rate: float = 0.1,
+                 kernel_size: int = 33, pe_maxlen: int = 5000):
+        super().__init__()
+        self.odim = d_model
+        self.input_preprocessor = Conv2dSubsampling(input_size, d_model)
+        self.positional_encoding = RelPositionalEncoding(d_model, pe_maxlen)
+        self.dropout = nn.Dropout(residual_dropout)
+        self.layer_stack = nn.ModuleList([
+            RelPosEmbConformerBlock(d_model, n_head, residual_dropout, dropout_rate, kernel_size)
+            for _ in range(num_blocks)
+        ])
+
+    def forward(self, padded_input: torch.Tensor, input_lengths: torch.Tensor, pad: bool = True):
+        if pad:
+            padded_input = nn.functional.pad(
+                padded_input, (0, 0, 0, self.input_preprocessor.context - 1), 'constant', 0.0
+            )
+        src_mask = self.padding_position_is_0(padded_input, input_lengths)
+        embed_output, input_lengths, src_mask = self.input_preprocessor(padded_input, src_mask)
+        enc_output = self.dropout(embed_output)
+        pos_emb = self.dropout(self.positional_encoding(embed_output))
+        for enc_layer in self.layer_stack:
+            enc_output = enc_layer(enc_output, pos_emb, slf_attn_mask=src_mask, pad_mask=src_mask)
+        return enc_output, input_lengths, src_mask
+
+    def padding_position_is_0(self, padded_input, input_lengths):
+        N, T = padded_input.size()[:2]
+        mask = torch.ones((N, T), device=padded_input.device)
+        for i in range(N):
+            mask[i, input_lengths[i]:] = 0
+        return mask.unsqueeze(1).to(torch.uint8)
+
+
+class FireRedASRAdapter(nn.Module):
+    """Adapter module to project encoder outputs to LLM input space."""
+
+    def __init__(self, encoder_dim: int, llm_dim: int, downsample_rate: int = 2):
+        super().__init__()
+        self.ds = downsample_rate
+        self.linear1 = nn.Linear(encoder_dim * downsample_rate, llm_dim)
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(llm_dim, llm_dim)
+
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor):
+        batch_size, seq_len, feat_dim = x.size()
+        num_frames_to_discard = seq_len % self.ds
+        if num_frames_to_discard > 0:
+            x = x[:, :-num_frames_to_discard, :]
+        seq_len = x.size(1)
+
+        x = x.contiguous()
+        x = x.view(
+            batch_size, seq_len // self.ds, feat_dim * self.ds
+        )
+
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+
+        new_x_lens = torch.clamp(x_lens, max=seq_len) // self.ds
+        return x, new_x_lens
+
+
+# === FireRedASR Multimodal Processing Components === #
+
+class FireRedASRProcessingInfo(BaseProcessingInfo):
+    """Processing info for FireRedASR model."""
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"audio": None}  # No limit on number of audio inputs
+
+    def get_hf_processor(self, **kwargs: object):
+        """FireRedASR uses custom audio processing, not HF processor."""
+        # For FireRedASR, we use our own audio feature extraction
+        return None
+
+    # 增加一个可配置的下采样率，供处理器使用，避免访问模型实例
+    @property
+    def audio_downsample_rate(self) -> int:
+        # 优先使用 runtime 覆盖值；其次从 HF 配置读取；最后默认 4
+        try:
+            if hasattr(self, "_audio_downsample_rate"):
+                return int(getattr(self, "_audio_downsample_rate"))
+        except Exception:
+            pass
+        try:
+            cfg = getattr(self.model_config, 'hf_config', None)
+            ds = getattr(cfg, 'encoder_downsample_rate', None) if cfg is not None else None
+            if ds is not None:
+                return int(ds)
+        except Exception:
+            pass
+        return 4 
+
+    def set_audio_downsample_rate(self, ds: int) -> None:
+        self._audio_downsample_rate = int(ds)
+
+
+class FireRedASRDummyInputsBuilder(BaseDummyInputsBuilder[FireRedASRProcessingInfo]):
+    """Dummy inputs builder for FireRedASR model profiling."""
+
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        num_audios = mm_counts.get("audio", 0)
+        # FireRedASR uses <|AUDIO|> as the default speech token
+        if num_audios == 0:
+            return ""
+
+        # Use FireRedASR's speech token
+        return "<|AUDIO|>" * num_audios
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+    ) -> MultiModalDataDict:
+        num_audios = mm_counts.get("audio", 0)
+
+        if num_audios == 0:
+            return {}
+
+        # Create dummy audio features - Use a reasonable size for profiling
+        # FireRedASR typically processes 6-10 seconds of audio
+        audio_len = 16000 * 6  # 6 seconds at 16kHz for dummy audio
+        audio_overrides = mm_options.get("audio") if mm_options else None
+
+        return {
+            "audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios, overrides=audio_overrides)
+        }
+def _fireredasr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+    """Field configuration for FireRedASR inputs."""
+    return dict(
+        audio_embeds=MultiModalFieldConfig.batched("audio"),
+        input_features=MultiModalFieldConfig.batched("audio"),
+        feature_lengths=MultiModalFieldConfig.batched("audio"),
+        audio_token_lengths=MultiModalFieldConfig.batched("audio"),
+    )
+
+
+class FireRedASRMultiModalDataParser(MultiModalDataParser):
+    """Data parser for FireRedASR multimodal inputs."""
+
+    def _parse_audio_data(
+        self,
+        data: Union[dict[str, torch.Tensor], ModalityData[AudioItem]],
+    ) -> Optional[ModalityDataItems[Any, Any]]:
+        if isinstance(data, dict):
+            return DictEmbeddingItems(
+                data,
+                modality="audio",
+                required_fields={"audio_embeds"},
+                fields_factory=_fireredasr_field_config,
+            )
+
+        return super()._parse_audio_data(data)
+
+
+class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessingInfo]):
+    """Multimodal processor for FireRedASR model (encoder-decoder interface)."""
+
+    def __init__(
+        self,
+        info: FireRedASRProcessingInfo,
+        dummy_inputs: BaseDummyInputsBuilder[FireRedASRProcessingInfo],
+        *,
+        cache=None,
+    ) -> None:
+        super().__init__(info, dummy_inputs, cache=cache)
+        # Ensure decoder_start_token_id is configured on HF config before
+        # InputPreprocessor queries it. This runs early when the processor
+        # is created by InputPreprocessor.
+        try:
+            hf_cfg = self.info.model_config.hf_config
+        except Exception:
+            hf_cfg = None
+        if hf_cfg is not None and getattr(hf_cfg, 'decoder_start_token_id', None) is None:
+            # Avoid depending on tokenizer initialization. Use a stable default.
+            try:
+                setattr(hf_cfg, 'decoder_start_token_id', 1)
+            except Exception:
+                pass
+        # Initialize CMVN stats to align audio preprocessing with FireRedASR
+        # reference implementation (ASRFeatExtractor).
+        self._cmvn_means = None  # type: Optional[torch.Tensor]
+        self._cmvn_istd = None   # type: Optional[torch.Tensor]
+        try:
+            self._init_cmvn_stats()
+        except Exception:
+            # Proceed without CMVN if initialization fails.
+            self._cmvn_means = None
+            self._cmvn_istd = None
+    
+    def _get_dummy_inputs_builder(self) -> BaseDummyInputsBuilder:
+        """Returns the custom dummy inputs builder for FireRedASR."""
+        return FireRedASRDummyInputsBuilder(self.info)
+
+    def _get_data_parser(self) -> MultiModalDataParser:
+        # FireRedASR expects 16kHz audio input
+        return FireRedASRMultiModalDataParser(target_sr=16000)
+
+    @property
+    def pad_dummy_encoder_prompt(self) -> bool:
+        # For profiling, pad dummy encoder prompt to match audio token count
+        return True
+
+    def create_encoder_prompt(
+        self,
+        prompt: Union[str, list[int]],
+        mm_data: MultiModalDataDict,
+    ) -> Union[str, list[int]]:
+        # Use a single dummy token as encoder prompt anchor.
+        # This will be replaced by audio placeholders downstream.
+        return [0]
+
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> bool:
+        """
+        FireRedASR 的 HF 处理器不直接在 `input_ids` 上展开占位符，
+        我们希望由 vLLM 的通用逻辑来应用 PromptUpdate（根据特征长度展开）。
+
+        因此这里强制返回 False，让 `_maybe_apply_prompt_updates` 走手动应用分支。
+        """
+        return False
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, Any],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """Process audio data for FireRedASR."""
+        from transformers import BatchFeature
+        import numpy as np
+        # Prefer torchaudio Kaldi fbank; fall back to librosa
+        import torchaudio  # type: ignore
+        import kaldi_native_fbank as knf  # type: ignore
+        import kaldiio  # type: ignore
+
+        audios = mm_data.pop("audios", [])
+        if audios:
+            mm_data["audio"] = audios
+            
+        # For text-only input
+        if not mm_data.get("audio", []):
+            prompt_ids = self.info.get_tokenizer().encode(prompt)
+            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
+            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
+
+        # Process audio inputs
+        audios = mm_data.get("audio", [])
+        if not isinstance(audios, list):
+            audios = [audios]
+
+        # Validate that we have actual audio data
+        if not audios or len(audios) == 0:
+            prompt_ids = self.info.get_tokenizer().encode(prompt)
+            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
+            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
+
+        # Extract Fbank features for each audio
+        input_features_list = []
+        feature_lengths_list = []
+
+        for audio_item in audios:
+            # Unpack audio data and sample rate
+            if isinstance(audio_item, tuple):
+                audio_data, sample_rate = audio_item
+            else:
+                audio_data = audio_item
+                sample_rate = 16000  # Default sample rate
+
+            # Convert to numpy mono float32 waveform
+            if isinstance(audio_data, torch.Tensor):
+                audio_data = audio_data.detach().cpu().numpy()
+            audio_data = np.asarray(audio_data, dtype=np.float32).reshape(-1)
+
+            # Resample to 16kHz if needed
+            if sample_rate != 16000:
+                audio_tensor = torch.from_numpy(audio_data).unsqueeze(0)
+                audio_tensor = torchaudio.functional.resample(audio_tensor, sample_rate, 16000)
+                audio_data = audio_tensor.squeeze(0).cpu().numpy()
+
+            # Compute fbank features — prefer kaldi-native-fbank to match HF
+            feats: torch.Tensor
+            import kaldi_native_fbank as knf  # type: ignore
+            opts = knf.FbankOptions()
+            opts.frame_opts.dither = 0.0
+            opts.mel_opts.num_bins = 80
+            opts.frame_opts.snip_edges = True
+            opts.mel_opts.debug_mel = False
+            fbank = knf.OnlineFbank(opts)
+            fbank.accept_waveform(16000, audio_data.tolist())
+            frames =[]
+            for i in range(fbank.num_frames_ready):
+                frames.append(fbank.get_frame(i))
+            if len(frames) == 0:
+                feats = torch.zeros((0, opts.mel_opts.num_bins), dtype=torch.float32)
+            else:
+                feats_np = np.vstack(frames)
+                feats = torch.from_numpy(feats_np).float()
+
+            wav = torch.from_numpy(audio_data).float().unsqueeze(0)
+            feats = torchaudio.compliance.kaldi.fbank(
+                wav,
+                sample_frequency=16000,
+                num_mel_bins=80,
+                frame_length=25.0,
+                frame_shift=10.0,
+                dither=0.0,
+                energy_floor=1.0,
+                use_energy=False,
+            )  # (T, 80)
+
+
+            # Apply CMVN — global when available, else per-utterance
+            try:
+                feats = (feats - self._cmvn_means.to(feats.device, feats.dtype)) * self._cmvn_istd.to(feats.device, feats.dtype)
+            except Exception:
+                mean = feats.mean(dim=0, keepdim=True)
+                std = feats.std(dim=0, keepdim=True)
+                std = torch.where(std < 1e-6, torch.full_like(std, 1.0), std)
+                feats = (feats - mean) / std
+
+            input_features_list.append(feats)
+            feature_lengths_list.append(int(feats.shape[0]))
+        # Safety check: ensure we have features
+        if not input_features_list or len(input_features_list) == 0:
+            # Create dummy features if no valid audio could be processed
+            input_features_list = [torch.zeros(100, 80, dtype=torch.float32)]  # 100 time steps, 80 mel bins
+            feature_lengths_list = [100]
+
+        # Pad features to same length
+        max_len = max(feat.shape[0] for feat in input_features_list)
+        if max_len == 0:
+            max_len = 100  # Minimum fallback
+
+        padded_features = []
+        for features in input_features_list:
+            if features.shape[0] < max_len:
+                # Ensure padding has the same dtype as the features
+                padding = torch.zeros(max_len - features.shape[0], features.shape[1],
+                                    dtype=features.dtype, device=features.device)
+                features = torch.cat([features, padding], dim=0)
+            padded_features.append(features)
+
+        # Stack into batch tensor (B, T, F) then transpose to (B, F, T)
+        input_features = torch.stack(padded_features, dim=0).transpose(1, 2)  # (B, F, T)
+        # Debug: optional shape print for alignment
+        if os.environ.get('VLLM_FIRERED_DEBUG', '0') == '1':
+            try:
+                print(f"[FireRedASR] input_features shape: {tuple(input_features.shape)}; feature_lengths: {feature_lengths_list}")
+            except Exception:
+                pass
+        feature_lengths = torch.tensor(feature_lengths_list, dtype=torch.long)
+
+        # Get prompt tokens via chat template and ensure audio placeholders are present
+        tokenizer = self.info.get_tokenizer()
+        messages = [
+            {"role": "user", "content": "<speech>请转写音频为文字"},
+            {"role": "assistant", "content": ""},
+        ]
+        TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + \n'\n' + message['content']}}{% if loop.last %}{{ ''}}{% else %}{{ '<|im_end|>\n' }}{% endif %}{% endfor %}"
+        try:
+            prompt_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                chat_template=TEMPLATE,
+                add_generation_prompt=False,
+                padding=False,
+            )
+        except Exception:
+            prompt_ids = tokenizer.encode("<speech>请转写音频为文字")
+        prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
+
+        # Number of audio items provided
+        audio_items = audios
+        if not isinstance(audio_items, list):
+            audio_items = [audio_items]
+        num_audios = len(audio_items)
+
+        # Choose a placeholder string that is actually encodable by the tokenizer
+        def _choose_audio_placeholder_text():
+            candidates = [
+                "<|AUDIO|>",
+                "<|audio|>",
+                "<audio>",
+                "[AUDIO]",
+                "audio",
+            ]
+            for text in candidates:
+                try:
+                    # Prefer candidates that resolve to a non-UNK id
+                    tok_id = tokenizer.convert_tokens_to_ids(text)
+                except Exception:
+                    tok_id = None
+                try:
+                    ids = tokenizer.encode(text, add_special_tokens=False)
+                except TypeError:
+                    ids = tokenizer.encode(text)
+                # Accept only if id is known or ids are non-empty
+                if (tok_id is not None and tok_id != getattr(tokenizer, 'unk_token_id', None)) \
+                        or (isinstance(ids, list) and len(ids) > 0):
+                    return text, ids
+            return None,[]
+
+        placeholder_text, placeholder_ids = _choose_audio_placeholder_text()
+
+        # Count occurrences of a sub-sequence within a sequence
+        def count_subseq(seq: list[int], sub: list[int]) -> int:
+            if not seq or not sub or len(sub) > len(seq):
+                return 0
+            count = 0
+            i = 0
+            L = len(seq)
+            M = len(sub)
+            while i <= L - M:
+                if seq[i:i + M] == sub:
+                    count += 1
+                    i += M
+                else:
+                    i += 1
+            return count
+
+        # If the prompt has fewer placeholders than audios, append the missing ones
+        if num_audios > 0 and placeholder_ids:
+            current = count_subseq(prompt_ids, placeholder_ids)
+            missing = num_audios - current
+            if missing > 0:
+                prompt_ids = prompt_ids + (placeholder_ids * missing)
+
+        # Precompute expected audio token lengths after downsampling so that
+        # prompt updates can match embedding lengths exactly.
+        try:
+            ds = self.info.audio_downsample_rate
+        except Exception:
+            ds = 4
+        token_lengths_list = [max(1, int(l) // int(ds)) for l in feature_lengths_list]
+        audio_token_lengths = torch.tensor(token_lengths_list, dtype=torch.long)
+
+        return BatchFeature(
+            dict(
+                input_ids=[prompt_ids],
+                input_features=input_features,
+                feature_lengths=feature_lengths,
+                audio_token_lengths=audio_token_lengths,
+            ),
+            tensor_type="pt"
+        )
+
+    def _init_cmvn_stats(self) -> None:
+        """Initialize CMVN stats from env or HF config.
+
+        Tries the following in order:
+        - Env var `FIREREDASR_CMVN_PATH`
+        - HF config field `cmvn_path`
+        - If model path is a directory, `<model>/cmvn.ark`
+        """
+        import os
+        cmvn_path = os.getenv('FIREREDASR_CMVN_PATH', '/workspace/bella-infra/user/zhangshuge002/FireRedASR/FireRedASR/out/fireredasr-llm-hf-test/cmvn.ark')
+        if not cmvn_path:
+            try:
+                cfg = getattr(self.info.model_config, 'hf_config', None)
+                cmvn_path = getattr(cfg, 'cmvn_path', None) if cfg is not None else None
+            except Exception:
+                cmvn_path = None
+        if not cmvn_path:
+            # Try to resolve from model directory
+            try:
+                model_dir = getattr(self.info.model_config, 'model', None)
+                if isinstance(model_dir, str) and os.path.isdir(model_dir):
+                    candidate = os.path.join(model_dir, 'cmvn.ark')
+                    if os.path.exists(candidate):
+                        cmvn_path = candidate
+            except Exception:
+                pass
+        if not cmvn_path or not os.path.exists(cmvn_path):
+            # CMVN not available
+            self._cmvn_means = None
+            self._cmvn_istd = None
+            return
+
+        # Load Kaldi CMVN stats
+        try:
+            import kaldiio  # type: ignore
+            stats = kaldiio.load_mat(cmvn_path)
+        except Exception:
+            # If kaldiio is not available, skip CMVN
+            self._cmvn_means = None
+            self._cmvn_istd = None
+            return
+
+        # stats shape: (2, dim+1)
+        dim = stats.shape[-1] - 1
+        count = float(stats[0, dim])
+        if count < 1.0:
+            self._cmvn_means = None
+            self._cmvn_istd = None
+            return
+        floor = 1e-20
+        means =[]
+        inv_std =[]
+        for d in range(dim):
+            mean = float(stats[0, d]) / count
+            var = float(stats[1, d]) / count - mean * mean
+            if var < floor:
+                var = floor
+            istd = 1.0 / (var ** 0.5)
+            means.append(mean)
+            inv_std.append(istd)
+        # Store as tensors of shape (1, dim) to broadcast over time
+        self._cmvn_means = torch.tensor(means, dtype=torch.float32).unsqueeze(0)
+        self._cmvn_istd = torch.tensor(inv_std, dtype=torch.float32).unsqueeze(0)
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return _fireredasr_field_config(hf_inputs)
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        """Generate prompt updates for FireRedASR."""
+
+        out_mm_data = out_mm_kwargs.get_data()
+
+        def get_replacement_fireredasr(item_idx: int):
+            # Calculate number of audio tokens for this item
+            # Check if we have audio_embeds or need to compute from features
+            if "audio_token_lengths" in out_mm_data:
+                atl = out_mm_data["audio_token_lengths"]
+                try:
+                    if isinstance(atl, torch.Tensor):
+                        value = int(atl[int(item_idx)].item())
+                    elif isinstance(atl, (list, tuple)):
+                        value = int(atl[int(item_idx)])
+                    else:
+                        import numpy as np
+                        if isinstance(atl, np.ndarray):
+                            value = int(atl[int(item_idx)])
+                        else:
+                            value = 1
+                except Exception:
+                    value = 1
+                num_features = max(1, value)
+            elif "audio_embeds" in out_mm_data:
+                audio_embeds = out_mm_data["audio_embeds"]
+                if isinstance(audio_embeds, (list, tuple)) and len(audio_embeds) > item_idx:
+                    audio_embed = audio_embeds[item_idx]
+                    if hasattr(audio_embed, 'shape') and len(audio_embed.shape) >= 1:
+                        num_features = audio_embed.shape[0]
+                    else:
+                        num_features = 1  # Fallback
+                else:
+                    num_features = 1  # Fallback
+            elif "feature_lengths" in out_mm_data:
+                feature_lengths = out_mm_data["feature_lengths"]
+                downsample_rate = self.info.audio_downsample_rate
+
+                # 兼容张量 / 列表 / numpy 数组三种情况，健壮取值
+                try:
+                    if isinstance(feature_lengths, torch.Tensor):
+                        if feature_lengths.ndim == 0:
+                            value = int(feature_lengths.item())
+                        else:
+                            value = int(feature_lengths[int(item_idx)].item())
+                        num_features = max(1, value // downsample_rate)
+                    elif isinstance(feature_lengths, (list, tuple)):
+                        value = int(feature_lengths[int(item_idx)])
+                        num_features = max(1, value // downsample_rate)
+                    else:
+                        import numpy as np
+                        if isinstance(feature_lengths, np.ndarray):
+                            value = int(feature_lengths[int(item_idx)])
+                            num_features = max(1, value // downsample_rate)
+                        else:
+                            num_features = 1
+                except Exception:
+                    num_features = 1  # 任何索引/类型异常时安全回退
+            else:
+                # Fallback: use a reasonable default number of tokens
+                num_features = 100  # Default for ~6 seconds of audio
+
+            if num_features == 0:
+                # Handle edge case where audio is too short
+                audios = mm_items.get_items("audio", AudioProcessorItems)
+                if audios is not None:
+                    try:
+                        audio_len = audios.get_audio_length(item_idx)
+                        raise ValueError(f"The audio (len={audio_len}) is too short "
+                                       "to be represented inside the model")
+                    except:
+                        pass
+                num_features = 1  # Minimum fallback
+
+            # Get tokenizer and use a simple audio token
+            tokenizer = self.info.get_tokenizer()
+
+            # Try to get speech token ID, with fallbacks
+            try:
+                speech_token_id = tokenizer.convert_tokens_to_ids("<|AUDIO|>")
+                audio_bos_id = tokenizer.convert_tokens_to_ids("<|audio_bos|>")
+                audio_eos_id = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
+
+                # Fallbacks for BOS/EOS markers if custom tokens are missing
+                if audio_bos_id is None or audio_bos_id == getattr(tokenizer, 'unk_token_id', None):
+                    audio_bos_id = getattr(tokenizer, 'bos_token_id', 1)
+                if audio_eos_id is None or audio_eos_id == getattr(tokenizer, 'unk_token_id', None):
+                    audio_eos_id = getattr(tokenizer, 'eos_token_id', 2)
+
+                if speech_token_id == getattr(tokenizer, 'unk_token_id', None) or speech_token_id is None:
+                    # Try alternative tokens
+                    alternatives = ["<|AUDIO|>", "<|audio|>", "<audio>", "[AUDIO]", "audio", "<unk>"]
+                    for alt_token in alternatives:
+                        speech_token_id = tokenizer.convert_tokens_to_ids(alt_token)
+                        if speech_token_id != getattr(tokenizer, 'unk_token_id', None) and speech_token_id is not None:
+                            break
+                    else:
+                        # Final fallback to a common token
+                        speech_token_id = tokenizer.convert_tokens_to_ids("a")
+                        if speech_token_id == getattr(tokenizer, 'unk_token_id', None) or speech_token_id is None:
+                            speech_token_id = 100  # Arbitrary safe token ID
+            except Exception:
+                # Generic fallback values
+                speech_token_id = 100
+                audio_bos_id = getattr(tokenizer, 'bos_token_id', 1)
+                audio_eos_id = getattr(tokenizer, 'eos_token_id', 2)
+            
+            speech_token=[speech_token_id] * num_features
+
+            return PromptUpdateDetails.select_token_id(
+                [audio_bos_id] + speech_token + [audio_eos_id],  # Use token IDs instead of strings
+                embed_token_id=speech_token_id,  # Use the same token ID for embedding
+            )
+
+        # 在编码器提示中用一个稳定的锚点 [0]，确保匹配成功
+        return [
+            PromptReplacement(
+                modality="audio",
+                target=[0],
+                replacement=get_replacement_fireredasr,
+            )
+        ]
+    
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    FireRedASRMultiModalProcessor,
+    info=FireRedASRProcessingInfo,
+    dummy_inputs=FireRedASRDummyInputsBuilder)
+class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiModal, SupportsPP):
+    """FireRedASR LLM model for Speech-to-Text transcription."""
+
+    # Required by SupportsTranscription interface
+    supported_languages = {
+        "en": "english",
+        "zh": "chinese",
+        "ja": "japanese",
+        "ko": "korean",
+        # Add more languages as needed
+    }
+    supports_transcription = True
+    supports_transcription_only = True  # Pure ASR model
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+        """Get placeholder string for audio input."""
+        if modality.startswith("audio"):
+            # 使用参考实现的语音占位符
+            return "<speech>"
+        return None
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        multimodal_config = vllm_config.model_config.multimodal_config
+
+        self.config = config
+        # Ensure vLLM treats this model as encoder-decoder for V1 pipeline
+        # so that the encoder flow runs and get_multimodal_embeddings is used.
+        try:
+            setattr(self.config, 'is_encoder_decoder', True)
+        except Exception:
+            pass
+        self.multimodal_config = multimodal_config
+
+        # FireRedASR components
+        # FireRedASR encoder hidden dim：优先使用 d_model，其次 encoder_dim
+        encoder_dim = getattr(config, 'encoder_dim', getattr(config, 'd_model', 512))
+        llm_dim = getattr(config, 'hidden_size', 3584)  # Qwen2-7B hidden size
+        downsample_rate = getattr(config, 'encoder_downsample_rate', 4)
+
+        # Speech encoder (Conformer) — 参考实现参数命名
+        self.speech_encoder = ConformerEncoder(
+            input_size=getattr(config, 'idim', getattr(config, 'encoder_input_size', 80)),
+            num_blocks=getattr(config, 'n_layers_enc', getattr(config, 'num_encoder_layers', 12)),
+            n_head=getattr(config, 'n_head', 8),
+            d_model=encoder_dim,
+            residual_dropout=getattr(config, 'residual_dropout', 0.1),
+            dropout_rate=getattr(config, 'dropout_rate', getattr(config, 'encoder_dropout_rate', 0.1)),
+            kernel_size=getattr(config, 'kernel_size', 33),
+            pe_maxlen=getattr(config, 'pe_maxlen', 5000),
+        )
+
+        # Adapter/Projector
+        self.multi_modal_projector = FireRedASRAdapter(
+            encoder_dim, llm_dim, downsample_rate
+        )
+
+        self.quant_config = quant_config
+
+        # Language model (Qwen2) - create a compatible config for the LLM part
+        try:
+            from transformers import Qwen2Config
+        except ImportError:
+            # Fallback in case Qwen2Config is not available
+            from transformers import AutoConfig
+            Qwen2Config = AutoConfig
+        llm_config = Qwen2Config(
+            vocab_size=getattr(config, 'vocab_size', 152064),
+            hidden_size=llm_dim,
+            intermediate_size=getattr(config, 'intermediate_size', 18944),
+            num_hidden_layers=getattr(config, 'num_hidden_layers', 28),
+            num_attention_heads=getattr(config, 'num_attention_heads', 28),
+            num_key_value_heads=getattr(config, 'num_key_value_heads', 4),
+            hidden_act=getattr(config, 'hidden_act', 'silu'),
+            max_position_embeddings=getattr(config, 'max_position_embeddings', 32768),
+            initializer_range=getattr(config, 'initializer_range', 0.02),
+            rms_norm_eps=getattr(config, 'rms_norm_eps', 1e-6),
+            use_cache=getattr(config, 'use_cache', True),
+            tie_word_embeddings=getattr(config, 'tie_word_embeddings', False),
+            rope_theta=getattr(config, 'rope_theta', 1000000.0),
+            use_sliding_window=getattr(config, 'use_sliding_window', False),
+            sliding_window=getattr(config, 'sliding_window', None),
+            max_window_layers=getattr(config, 'max_window_layers', 28),
+            attention_dropout=getattr(config, 'attention_dropout', 0.0),
+            
+        )
+
+        self.language_model = init_vllm_registered_model(
+            vllm_config=vllm_config,
+            hf_config=llm_config,
+            prefix=maybe_prefix(prefix, "language_model"),
+            architectures=["Qwen2ForCausalLM"],
+        )
+
+        # Special token IDs and tokenizer for ASR
+        self.speech_token_id = getattr(config, 'speech_token_id', None)
+        self.tokenizer = self._get_tokenizer(vllm_config)
+
+        # Ensure decoder start token id is set for encoder-decoder preprocessing.
+        # If not provided by the HF config, fall back to tokenizer BOS/EOS or 1.
+        try:
+            dec_start = getattr(config, 'decoder_start_token_id', None)
+        except Exception:
+            dec_start = None
+        if dec_start is None:
+            bos_id = getattr(self.tokenizer, 'bos_token_id', None)
+            eos_id = getattr(self.tokenizer, 'eos_token_id', None)
+            if isinstance(bos_id, int):
+                dec_start = bos_id
+            elif isinstance(eos_id, int):
+                dec_start = eos_id
+            else:
+                dec_start = 1  # safe fallback
+            try:
+                setattr(config, 'decoder_start_token_id', dec_start)
+            except Exception:
+                pass
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors)
+
+        # Load FireRedASR weights if checkpoint paths are provided
+        self._load_fireredasr_checkpoints(config, vllm_config)
+
+    def _load_fireredasr_checkpoints(self, config, vllm_config: VllmConfig):
+        """Load FireRedASR model weights from checkpoint files."""
+        # Check for checkpoint paths in config
+        model_path = getattr(config, 'fireredasr_model_path', None)
+        encoder_path = getattr(config, 'fireredasr_encoder_path', None)
+
+        # Also check in model config for alternative path locations
+        model_config = vllm_config.model_config
+        model_dir = getattr(model_config, 'model', '')
+
+        # Try to find checkpoint files in the model directory
+        if model_path is None and model_dir:
+            candidate_model_path = os.path.join(model_dir, 'model.pth.tar')
+            if os.path.exists(candidate_model_path):
+                model_path = candidate_model_path
+
+        if encoder_path is None and model_dir:
+            candidate_encoder_path = os.path.join(model_dir, 'asr_encoder.pth.tar')
+            if os.path.exists(candidate_encoder_path):
+                encoder_path = candidate_encoder_path
+
+        # Load weights if checkpoint files are found
+        if model_path and os.path.exists(model_path):
+            try:
+                model_state_dict, encoder_state_dict, args = _load_firered_llm_weights(
+                    model_path, encoder_path
+                )
+
+                # Load encoder weights if available
+                if encoder_state_dict and hasattr(self, 'speech_encoder'):
+                    # Filter encoder weights with appropriate prefix matching
+                    encoder_weights = {}
+                    for key, value in encoder_state_dict.items():
+                        if key.startswith('encoder.'):
+                            # Remove 'encoder.' prefix to match our module structure
+                            new_key = key[8:]  # len('encoder.') = 8
+                            encoder_weights[new_key] = value
+                        elif not key.startswith('decoder.') and not key.startswith('ctc.'):
+                            # Include other encoder-related weights
+                            encoder_weights[key] = value
+
+                    if encoder_weights:
+                        # Load encoder weights with strict=False to handle any mismatches
+                        missing_keys, unexpected_keys = self.speech_encoder.load_state_dict(
+                            encoder_weights, strict=False
+                        )
+                        if missing_keys:
+                            print(f"Missing encoder keys: {missing_keys}")
+                        if unexpected_keys:
+                            print(f"Unexpected encoder keys: {unexpected_keys}")
+
+                # Load adapter/projector weights if available
+                if model_state_dict and hasattr(self, 'multi_modal_projector'):
+                    # Filter adapter weights
+                    adapter_weights = {}
+                    for key, value in model_state_dict.items():
+                        if key.startswith('adapter.') or key.startswith('projector.'):
+                            # Remove prefix to match our module structure
+                            if key.startswith('adapter.'):
+                                new_key = key[8:]  # len('adapter.') = 8
+                            else:  # projector.
+                                new_key = key[10:]  # len('projector.') = 10
+                            adapter_weights[new_key] = value
+
+                    if adapter_weights:
+                        missing_keys, unexpected_keys = self.multi_modal_projector.load_state_dict(
+                            adapter_weights, strict=False
+                        )
+                        if missing_keys:
+                            print(f"Missing adapter keys: {missing_keys}")
+                        if unexpected_keys:
+                            print(f"Unexpected adapter keys: {unexpected_keys}")
+
+                print(f"Successfully loaded FireRedASR checkpoints from {model_path}")
+                if encoder_path:
+                    print(f"Encoder weights loaded from {encoder_path}")
+
+            except Exception as e:
+                print(f"Warning: Failed to load FireRedASR checkpoints: {e}")
+                print("Continuing with randomly initialized weights...")
+        else:
+            print("No FireRedASR checkpoint files found. Using randomly initialized weights.")
+
+    def _get_tokenizer(self, vllm_config: VllmConfig):
+        """Get the tokenizer for text generation."""
+        from transformers import AutoTokenizer
+        import os
+        env_tok = os.getenv('FIREREDASR_TOKENIZER_PATH', None)
+        cfg = getattr(vllm_config.model_config, 'hf_config', None)
+        cfg_tok = getattr(cfg, 'fireredasr_tokenizer_path', None) if cfg is not None else None
+        user_default = "/workspace/bella-infra/user/libeibei031/vllm_FrieRedASR/FireRedASR/tools/out/fire-red-asr-aed-hf"
+        model_path = getattr(vllm_config.model_config, 'model', '')
+        tok_path = env_tok or cfg_tok or (model_path if model_path else user_default)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tok_path)
+        except Exception:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(model_path)
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
+        # Ensure DEFAULT_SPEECH_TOKEN exists
+        try:
+            tokenizer.add_special_tokens({"additional_special_tokens": ["<speech>"]})
+        except Exception:
+            pass
+        # Align pad/bos/eos to reference if available
+        try:
+            pad_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+            if isinstance(pad_id, int) and pad_id >= 0:
+                tokenizer.pad_token = "<|endoftext|>"
+                tokenizer.pad_token_id = pad_id
+        except Exception:
+            pass
+        try:
+            bos_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+            if isinstance(bos_id, int) and bos_id >= 0:
+                tokenizer.bos_token = "<|im_start|>"
+                tokenizer.bos_token_id = bos_id
+        except Exception:
+            pass
+        try:
+            eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+            if isinstance(eos_id, int) and eos_id >= 0:
+                tokenizer.eos_token = "<|im_end|>"
+                tokenizer.eos_token_id = eos_id
+        except Exception:
+            pass
+        # Cache speech token id
+        try:
+            self.speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
+        except Exception:
+            pass
+        return tokenizer
+
+    def _validate_and_reshape_mm_tensor(self, mm_input: object,
+                                       name: str) -> torch.Tensor | list[torch.Tensor]:
+        """Validate and normalize multimodal tensors to expected shapes.
+
+        - input_features: expect (B, F, T) torch.Tensor. If a list of (T, F),
+          pad to max T, stack to (B, T, F) then transpose to (B, F, T).
+        - feature_lengths: return 1D long tensor of shape (B,).
+        - audio_embeds: keep as list of tensors.
+        """
+        # audio_embeds are passed through as list for later tuple conversion
+        if name == "audio_embeds":
+            if isinstance(mm_input, (list, tuple)):
+                return [x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
+                        for x in mm_input]
+            if isinstance(mm_input, torch.Tensor):
+                return [mm_input]
+            raise ValueError(f"Incorrect type of {name}. Got type: {type(mm_input)}")
+
+        if name == "feature_lengths":
+            if isinstance(mm_input, torch.Tensor):
+                t = mm_input.to(dtype=torch.long)
+                # Expect 1D (B,). If given (B, 1) 或更高维，拉平成 1D。
+                if t.ndim == 1:
+                    return t
+                return t.reshape(-1)
+            if isinstance(mm_input, (list, tuple)):
+                return torch.tensor(list(mm_input), dtype=torch.long)
+            raise ValueError(f"Incorrect type of {name}. Got type: {type(mm_input)}")
+
+        if name == "input_features":
+            if isinstance(mm_input, torch.Tensor):
+                # Expect (N, F, T). If higher rank, merge leading dims.
+                if mm_input.ndim == 3:
+                    return mm_input
+                elif mm_input.ndim > 3:
+                    # Flatten leading dimensions into a single N
+                    F = mm_input.shape[-2]
+                    T = mm_input.shape[-1]
+                    return mm_input.reshape(-1, F, T).contiguous()
+                else:
+                    # If 2D, interpret as (T, F) then expand batch=1
+                    if mm_input.ndim == 2:
+                        return mm_input.transpose(0, 1).unsqueeze(0)
+                    raise ValueError(f"input_features must be 2D/3D/4D, got {mm_input.ndim}D")
+            if isinstance(mm_input, (list, tuple)):
+                tensors: list[torch.Tensor] = [
+                    x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in mm_input
+                ]
+                # Ensure each is (T, F)
+                proc: list[torch.Tensor] =[]
+                max_len = 0
+                for t in tensors:
+                    if t.ndim == 2:
+                        proc.append(t)
+                    elif t.ndim == 3 and t.shape[0] == 1:
+                        proc.append(t.squeeze(0))
+                    else:
+                        # Best effort: flatten to (T, F)
+                        proc.append(t.reshape(t.shape[0], -1))
+                    max_len = max(max_len, proc[-1].shape[0])
+
+                padded: list[torch.Tensor] =[]
+                for t in proc:
+                    if t.shape[0] < max_len:
+                        pad = torch.zeros(max_len - t.shape[0], t.shape[1], dtype=t.dtype, device=t.device)
+                        t = torch.cat([t, pad], dim=0)
+                    padded.append(t)
+                # (B, T, F) -> (B, F, T)
+                return torch.stack(padded, dim=0).transpose(1, 2).contiguous()
+            raise ValueError(f"Incorrect type of {name}. Got type: {type(mm_input)}")
+
+        # Fallback: return tensor as-is
+        if isinstance(mm_input, torch.Tensor):
+            return mm_input
+        raise ValueError(f"Incorrect type of {name}. Got type: {type(mm_input)}")
+
+    def _parse_and_validate_audio_input(
+            self, **kwargs: object) -> Optional[FireRedASRInputs]:
+        input_features = kwargs.pop('input_features', None)
+        audio_embeds = kwargs.pop('audio_embeds', None)
+        feature_lengths = kwargs.pop('feature_lengths', None)
+
+        if input_features is None and audio_embeds is None:
+            return None
+
+        if audio_embeds is not None:
+            if not isinstance(audio_embeds, (torch.Tensor, list)):
+                raise ValueError("Incorrect type of audio embeds."
+                               f"Got type: {type(audio_embeds)}")
+            audio_embeds = self._validate_and_reshape_mm_tensor(
+                audio_embeds, "audio_embeds")
+            return FireRedASREmbeddingInputs(type="audio_embeds",
+                                           audio_embeds=audio_embeds)
+
+        if input_features is not None:
+            input_features = self._validate_and_reshape_mm_tensor(
+                input_features, 'input_features')
+            if feature_lengths is not None:
+                feature_lengths = self._validate_and_reshape_mm_tensor(
+                    feature_lengths, 'feature_lengths')
+            else:
+                # Create default lengths if not provided
+                batch_size = input_features.shape[0]
+                seq_len = input_features.shape[-1]
+                feature_lengths = torch.full((batch_size,), seq_len,
+                                           dtype=torch.long,
+                                           device=input_features.device)
+
+            return FireRedASRFeatureInputs(
+                type="audio_features",
+                input_features=input_features,
+                feature_lengths=feature_lengths)
+
+        raise AssertionError("This line should be unreachable.")
+
+    def _process_audio_input(
+        self, audio_input: FireRedASRInputs
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, ...]]:
+        if audio_input["type"] == "audio_embeds":
+            audio_embeds = audio_input["audio_embeds"]
+            return tuple(audio_embeds)
+
+        # Process raw audio features
+        input_features = audio_input["input_features"]
+        feature_lengths = audio_input["feature_lengths"]
+
+        # Transpose from (B, F, T) to (B, T, F) for encoder
+        input_features = input_features.transpose(1, 2)
+
+        # Ensure input tensor matches the encoder dtype (for mixed precision)
+        target_dtype = None
+        try:
+            target_dtype = self.speech_encoder.input_preprocessor.out.weight.dtype
+        except Exception:
+            # fallback to any parameter's dtype
+            try:
+                target_dtype = next(self.speech_encoder.parameters()).dtype
+            except StopIteration:
+                target_dtype = input_features.dtype
+        if input_features.dtype != target_dtype:
+            input_features = input_features.to(dtype=target_dtype)
+
+        # Pass through speech encoder
+        encoder_out, enc_lengths, enc_mask = self.speech_encoder(
+            input_features, feature_lengths)
+
+        # Pass through adapter/projector
+        speech_features, speech_lens = self.multi_modal_projector(
+            encoder_out, enc_lengths)
+
+        # Split into individual sequences for batch processing
+        speech_features_list = []
+        for i, length in enumerate(speech_lens):
+            speech_features_list.append(speech_features[i, :length])
+
+        return tuple(speech_features_list)
+
+    def get_language_model(self) -> torch.nn.Module:
+        return self.language_model
+
+    def process_audio_features(self,
+                                 **kwargs: object) -> torch.Tensor:
+        audio_input = self._parse_and_validate_audio_input(**kwargs)
+        if audio_input is None:
+            return []
+        speech_features = self._process_audio_input(audio_input)
+        return speech_features
+
+    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
+        """Get multimodal embeddings for audio input."""
+        # This method is required by SupportsMultiModal interface
+        audio_input = self._parse_and_validate_audio_input(**kwargs)
+        if audio_input is None:
+            return []
+
+        speech_features = self._process_audio_input(audio_input)
+        # Convert tuple of tensors to list for MultiModalEmbeddings
+        if isinstance(speech_features, tuple):
+            return list(speech_features)
+        return speech_features
+
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
+        if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
+            placeholder_id = self._get_audio_placeholder_id()
+            inputs_embeds = self._merge_input_ids_with_speech_features(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                speech_embeddings=multimodal_embeddings,
+                speech_token_id=placeholder_id,
+            )
+        return inputs_embeds
+
+    def _merge_input_ids_with_speech_features(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        speech_embeddings: MultiModalEmbeddings,
+        speech_token_id: int,
+    ) -> torch.Tensor:
+        """
+        Merge speech feature sequences into inputs_embeds by replacing runs of
+        <speech> tokens with the provided speech embeddings, following the
+        reference logic of expanding each <speech> placeholder into a block of
+        audio frames.
+
+        - input_ids: (B, S)
+        - inputs_embeds: (B, S, H)
+        - speech_embeddings: list[Tensor], each of shape (T_i, H)
+        - speech_token_id: int token id for <speech>
+        """
+        if speech_embeddings is None or len(speech_embeddings) == 0:
+            return inputs_embeds
+
+        # Ensure 2D shape for input_ids
+        if isinstance(input_ids, torch.Tensor) and input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        B, S = input_ids.shape
+        H = inputs_embeds.shape[-1]
+        device = inputs_embeds.device
+        dtype = inputs_embeds.dtype
+
+        # Iterator over provided speech embeddings
+        emb_idx = 0
+
+        # Helper to pad or trim an embedding sequence to target length
+        def fit_to_length(seq: torch.Tensor, target_len: int) -> torch.Tensor:
+            cur = seq.shape[0]
+            if cur == target_len:
+                return seq
+            if cur > target_len:
+                return seq[:target_len]
+            # pad with zeros
+            pad = torch.zeros(target_len - cur, seq.shape[1], dtype=seq.dtype, device=seq.device)
+            return torch.cat([seq, pad], dim=0)
+
+        for b in range(B):
+            ids = input_ids[b]  # (S,)
+            # Find all positions where token == <speech>
+            speech_pos = (ids == speech_token_id).nonzero(as_tuple=False).flatten().tolist()
+            if not speech_pos:
+                continue
+            # Group contiguous positions as one run per audio segment
+            runs: list[tuple[int, int]] =[]
+            start = speech_pos[0]
+            prev = start
+            for idx in speech_pos[1:]:
+                if idx == prev + 1:
+                    prev = idx
+                else:
+                    runs.append((start, prev))
+                    start = prev = idx
+            runs.append((start, prev))
+
+            # For each run, take next speech embedding sequence and fill
+            for (l, r) in runs:
+                if emb_idx >= len(speech_embeddings):
+                    break
+                seg = speech_embeddings[emb_idx]
+                emb_idx += 1
+                if not isinstance(seg, torch.Tensor):
+                    seg = torch.as_tensor(seg)
+                # Ensure correct dtype/device and shape (T, H)
+                seg = seg.to(device=device, dtype=dtype)
+                if seg.ndim == 3 and seg.shape[0] == 1:
+                    seg = seg.squeeze(0)
+                if seg.ndim == 1:
+                    seg = seg.unsqueeze(0)
+                if seg.shape[-1] != H:
+                    # Best-effort: project or pad? Here we pad/trim feature dim for safety
+                    if seg.shape[-1] > H:
+                        seg = seg[..., :H]
+                    else:
+                        fpad = torch.zeros(seg.shape[0], H - seg.shape[1], dtype=seg.dtype, device=seg.device)
+                        seg = torch.cat([seg, fpad], dim=1)
+                run_len = r - l + 1
+                seg = fit_to_length(seg, run_len)  # (run_len, H)
+                inputs_embeds[b, l:r + 1, :] = seg
+
+        return inputs_embeds
+
+    def _get_audio_placeholder_id(self) -> int:
+        # Prefer configured speech token id if available
+        tok = getattr(self, 'tokenizer', None)
+        placeholder_id = getattr(self, 'speech_token_id', None)
+        unk_id = getattr(tok, 'unk_token_id', None) if tok is not None else None
+        if isinstance(placeholder_id, int) and placeholder_id != unk_id:
+            return int(placeholder_id)
+
+        # Try common audio placeholders via tokenizer
+        candidates = ["<|AUDIO|>", "<|audio|>", "<audio>", "[AUDIO]", "audio"]
+        if tok is not None:
+            for text in candidates:
+                try:
+                    pid = tok.convert_tokens_to_ids(text)
+                except Exception:
+                    pid = None
+                if isinstance(pid, int) and pid != unk_id:
+                    return int(pid)
+
+            # Fallback to a common token
+            try:
+                pid = tok.convert_tokens_to_ids("a")
+                if isinstance(pid, int) and pid != unk_id:
+                    return int(pid)
+            except Exception:
+                pass
+
+        # Final hard fallback
+        return 100
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        input_features: Optional[torch.Tensor] = None,
+        feature_lengths: Optional[torch.Tensor] = None,
+        **kwargs: object,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+
+        # In vLLM V1, always merge audio embeddings into inputs_embeds based on
+        # placeholder tokens present in input_ids; do not short-circuit to
+        # audio-only paths that construct their own BOS-only ids, which can
+        # desynchronize positions.
+
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+        elif inputs_embeds is None and input_ids is not None:
+            # Build multimodal embeddings from provided audio features if any.
+            multimodal_embeddings = None
+            if input_features is not None and feature_lengths is not None:
+                speech_features = self.process_audio_features(
+                    input_features=input_features,
+                    feature_lengths=feature_lengths
+                )
+                if isinstance(speech_features, tuple):
+                    multimodal_embeddings = list(speech_features)
+                elif speech_features is not None:
+                    multimodal_embeddings = [speech_features]
+
+            inputs_embeds = self.get_input_embeddings(input_ids,
+                                                      multimodal_embeddings)
+            input_ids = None
+
+        hidden_states = self.language_model.model(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+        return hidden_states
+
+    def forward_audio_only(
+        self,
+        input_features: torch.Tensor,
+        feature_lengths: torch.Tensor,
+        **kwargs
+    ) -> torch.Tensor:
+        """Forward pass for pure ASR (audio-only input)."""
+        # Process audio to get speech embeddings
+        speech_embeddings = self.process_audio_features(
+            input_features=input_features,
+            feature_lengths=feature_lengths
+        )
+
+        # Create minimal input IDs for generation start (BOS token)
+        batch_size = input_features.shape[0]
+        bos_token_id = getattr(self.tokenizer, 'bos_token_id', 1)
+        if bos_token_id is None:
+            bos_token_id = 1  # Fallback BOS token
+        bos_ids = torch.full((batch_size, 1), bos_token_id,
+                            device=input_features.device, dtype=torch.long)
+
+        # Get text embeddings for BOS token and combine with speech
+        # Convert speech_embeddings to MultiModalEmbeddings format
+        multimodal_embeddings = None
+        if speech_embeddings is not None:
+            if isinstance(speech_embeddings, tuple):
+                multimodal_embeddings = list(speech_embeddings)
+            else:
+                multimodal_embeddings = [speech_embeddings]
+
+        inputs_embeds = self.get_input_embeddings(bos_ids, multimodal_embeddings)
+
+        # Pass through language model for text generation
+        hidden_states = self.language_model.model(
+            input_ids=None,
+            positions=None,
+            inputs_embeds=inputs_embeds
+        )
+
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        return self.language_model.compute_logits(hidden_states)
+
+    @classmethod
+    def get_speech_to_text_config(
+        cls, model_config: ModelConfig, task_type: str
+    ) -> SpeechToTextConfig:
+        """Get the speech to text config for FireRedASR model."""
+        return SpeechToTextConfig(
+            sample_rate=16000,  # FireRedASR expects 16kHz audio input
+            max_audio_clip_s=30,  # Maximum audio clip duration in seconds
+            overlap_chunk_second=1,  # Overlap between audio chunks
+            min_energy_split_window_size=1600,  # 100ms at 16kHz for smart chunking
+        )
+
+    @classmethod
+    def get_num_audio_tokens(
+        cls, audio_duration_s: float, stt_config: SpeechToTextConfig,
+        model_config: ModelConfig
+    ) -> Optional[int]:
+        # Feature extraction: 10ms frame shift = 100 frames per second
+        frames_per_second = stt_config.sample_rate / 160  # 160 samples per frame (10ms at 16kHz)
+        total_frames = int(audio_duration_s * frames_per_second)
+
+        # Apply encoder downsampling (default is 2, but can be configured)
+        downsample_rate = getattr(model_config.hf_config, 'encoder_downsample_rate', 2)
+        downsampled_frames = total_frames // downsample_rate
+
+        return downsampled_frames
+
+    @classmethod
+    def get_generation_prompt(
+        cls,
+        audio: np.ndarray,
+        stt_config: SpeechToTextConfig,
+        model_config: ModelConfig,
+        language: Optional[str],
+        task_type: Literal["transcribe", "translate"],
+        request_prompt: str,
+        to_language: Optional[str],
+    ):
+        """Get the generation prompt for FireRedASR model."""
+        # Import here to avoid import errors if not available
+        try:
+            from vllm.inputs.data import TextPrompt
+        except ImportError:
+            # Fallback to dict if TextPrompt is not available
+            TextPrompt = dict
+
+        # FireRedASR is primarily designed for transcription
+        if task_type == "translate" and to_language is None:
+            raise ValueError("to_language must be specified for translation task")
+
+        # Build the text prompt based on task type and language
+        base_prompt = "Transcribe the following audio to text:"
+
+        # Add language context if specified
+        if language and language in cls.supported_languages:
+            lang_name = cls.supported_languages[language]
+            base_prompt = f"Transcribe the following {lang_name} audio to text:"
+
+        # Add translation context if needed
+        if task_type == "translate" and to_language:
+            if to_language in cls.supported_languages:
+                target_lang = cls.supported_languages[to_language]
+                base_prompt = f"Translate the following audio to {target_lang}:"
+            else:
+                base_prompt = f"Translate the following audio to {to_language}:"
+
+        # Add user's request prompt if provided
+        if request_prompt:
+            base_prompt = f"{request_prompt} {base_prompt}"
+
+        # Return TextPrompt with audio data
+        # This is correct for Decoder-Only models like FireRedASR
+        prompt = {
+            "prompt": base_prompt,
+            "multi_modal_data": {
+                "audio": (audio, stt_config.sample_rate),
+            }
+        }
+
+        return prompt
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        HF_LLM_CORE_PREFIX = 'model.'
+        TARGET_LLM_CORE_PREFIX = 'language_model.' + HF_LLM_CORE_PREFIX
+        
+        HF_LM_HEAD_PREFIX = 'lm_head.'
+        TARGET_LM_HEAD_PREFIX = 'language_model.' + HF_LM_HEAD_PREFIX
+        
+        # 1. 准备新的权重迭代器 (处理 Qwen2 前缀映射)
+        modified_weights = []
+        for name, weight in weights:
+            # A. 替换 LLM 核心权重 (Qwen2Model)
+            if name.startswith(HF_LLM_CORE_PREFIX):
+                new_name = TARGET_LLM_CORE_PREFIX + name[len(HF_LLM_CORE_PREFIX):]
+                modified_weights.append((new_name, weight))
+                
+            # B. 替换 LM Head 权重
+            elif name.startswith(HF_LM_HEAD_PREFIX):
+                new_name = TARGET_LM_HEAD_PREFIX + name[len(HF_LM_HEAD_PREFIX):]
+                modified_weights.append((new_name, weight))
+            
+            # C. 处理 LLM 模块的其他顶层权重 (如 embed_tokens, norm)
+            elif any(name.startswith(p) for p in ['embed_tokens.', 'norm.']):
+                new_name = 'language_model.' + name
+                modified_weights.append((new_name, weight))
+                
+            else:
+                # 保留其他权重 (如 vLLM 配置项等)
+                modified_weights.append((name, weight))
+                
+        # 2. 使用 AutoWeightsLoader 加载修改后的 LLM 权重
+        loader = AutoWeightsLoader(self)
+        # loaded_keys 包含所有通过 modified_weights 迭代器成功加载的 Qwen2 键
+        loaded_keys = loader.load_weights(modified_weights)
+        
+        # 收集 speech_encoder 的所有权重名称
+        if hasattr(self, 'speech_encoder'):
+            for name, _ in self.speech_encoder.named_parameters():
+                full_name = f'speech_encoder.{name}'
+                loaded_keys.add(full_name)
+
+        # 收集 multi_modal_projector 的所有权重名称
+        if hasattr(self, 'multi_modal_projector'):
+            for name, _ in self.multi_modal_projector.named_parameters():
+                full_name = f'multi_modal_projector.{name}'
+                loaded_keys.add(full_name)
+        
+        # 4. 返回包含 LLM 和 ASR 所有参数的集合
+        return loaded_keys
