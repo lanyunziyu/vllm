@@ -1551,7 +1551,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         mm_counts = mm_items.get_all_counts()
 
         _, mm_processed_data, _ = self._apply_hf_processor_text_mm(
-            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),
+            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),#出现标志位prompt：｜AOU｜
             mm_items=mm_items,
             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
             tokenization_kwargs=tokenization_kwargs,
@@ -1746,7 +1746,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                     item = kwargs, updates
                 else:
                     item = None
-
+ 
                 kwargs, updates = cache.get_and_update_item(item, item_hash)
 
                 merged_kwargs[modality].append(kwargs)

@@ -373,7 +373,7 @@ class InputPreprocessor:
         tokenization_kwargs: dict[str, Any] | None = None,
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
-    ) -> TokenInputs | MultiModalInputs:
+    ) -> TokenInputs | MultiModalInputs: 
         prompt_text = parsed_content["prompt"]
 
         inputs: TokenInputs | MultiModalInputs
