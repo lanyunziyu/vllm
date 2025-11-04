@@ -143,7 +143,7 @@ class RelPositionalEncoding(torch.nn.Module):
 
 
 class ScaledDotProductAttention(nn.Module):
-    def __init__(self, temperature: float):
+    def __init__(self, temperature):
         super().__init__()
         self.temperature = temperature
         self.dropout = nn.Dropout(0.0)
@@ -151,14 +151,21 @@ class ScaledDotProductAttention(nn.Module):
 
     def forward(self, q, k, v, mask=None):
         attn = torch.matmul(q, k.transpose(2, 3)) / self.temperature
+        output, attn = self.forward_attention(attn, v, mask)
+        return output, attn
+
+    def forward_attention(self, attn, v, mask=None):
         if mask is not None:
-            mask = mask.unsqueeze(1).eq(0)
+            mask = mask.unsqueeze(1)
+            mask = mask.eq(0)
             attn = attn.masked_fill(mask, -self.INF)
             attn = torch.softmax(attn, dim=-1).masked_fill(mask, 0.0)
         else:
             attn = torch.softmax(attn, dim=-1)
+
         d_attn = self.dropout(attn)
         output = torch.matmul(d_attn, v)
+
         return output, attn
 
 
@@ -207,8 +214,10 @@ class EncoderMultiHeadAttention(nn.Module):
 
 
 class RelPosMultiHeadAttention(EncoderMultiHeadAttention):
-    def __init__(self, n_head: int, d_model: int, residual_dropout: float = 0.1):
-        super().__init__(n_head, d_model, residual_dropout)
+    def __init__(self, n_head, d_model,
+                 residual_dropout=0.1):
+        super().__init__(n_head, d_model,
+                         residual_dropout)
         d_k = d_model // n_head
         self.scale = 1.0 / (d_k ** 0.5)
         self.linear_pos = nn.Linear(d_model, n_head * d_k, bias=False)
@@ -221,6 +230,7 @@ class RelPosMultiHeadAttention(EncoderMultiHeadAttention):
         N, H, T1, T2 = x.size()
         zero_pad = torch.zeros((N, H, T1, 1), device=x.device, dtype=x.dtype)
         x_padded = torch.cat([zero_pad, x], dim=-1)
+
         x_padded = x_padded.view(N, H, T2 + 1, T1)
         x = x_padded[:, :, 1:].view_as(x)
         x = x[:, :, :, : x.size(-1) // 2 + 1]
@@ -228,13 +238,31 @@ class RelPosMultiHeadAttention(EncoderMultiHeadAttention):
 
     def forward(self, q, k, v, pos_emb, mask=None):
         sz_b, len_q = q.size(0), q.size(1)
+
         residual = q
         q, k, v = self.forward_qkv(q, k, v)
-        # Compute scaled dot-product attention in head space without extra transposes
-        output, attn = self.attention(q, k, v, mask=mask)
-        # Project back to (B, T, d_model) and add residual (matches base class)
+
+        q = q.transpose(1, 2)
+        n_batch_pos = pos_emb.size(0)
+        p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.n_head, self.d_k)
+        p = p.transpose(1, 2)
+
+        q_with_bias_u = (q + self.pos_bias_u.to(q.device)).transpose(1, 2)
+        q_with_bias_v = (q + self.pos_bias_v.to(q.device)).transpose(1, 2)
+
+        matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
+
+        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+        matrix_bd = self._rel_shift(matrix_bd)
+
+        attn_scores = matrix_ac + matrix_bd
+        attn_scores.mul_(self.scale)
+
+        output, attn = self.attention.forward_attention(attn_scores, v, mask=mask)
+
         output = self.forward_output(output, residual, sz_b, len_q)
         return output, attn
+
 
 
 class ConformerConvolution(nn.Module):
@@ -1118,60 +1146,108 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                     model_path, encoder_path
                 )
 
-                # Load encoder weights if available
-                if encoder_state_dict and hasattr(self, 'speech_encoder'):
-                    # Filter encoder weights with appropriate prefix matching
+                # CORRECTED LOGIC based on FireRedASR implementation:
+                # 1. Encoder weights: Load from asr_encoder.pth.tar (AED model's encoder)
+                # 2. Adapter weights: Load from model.pth.tar with 'encoder_projector.' prefix
+
+                # FINAL CORRECTED LOGIC:
+                # Based on the actual checkpoint content you provided:
+                # - model.pth.tar contains encoder weights with 'encoder.' prefix
+                # - asr_encoder.pth.tar only contains 'args', no actual weights
+                # So we should load encoder weights from model.pth.tar, not asr_encoder.pth.tar
+
+                # Load encoder weights from model.pth.tar (where they actually are!)
+                if model_state_dict and hasattr(self, 'speech_encoder'):
+                    # Get expected parameter names AND buffer names from our speech_encoder
+                    expected_params = set(name for name, _ in self.speech_encoder.named_parameters())
+                    expected_buffers = set(name for name, _ in self.speech_encoder.named_buffers())
+                    expected_all = expected_params.union(expected_buffers)
+
                     encoder_weights = {}
-                    for key, value in encoder_state_dict.items():
+
+                    # Extract encoder weights with 'encoder.' prefix from model.pth.tar
+                    for key, value in model_state_dict.items():
                         if key.startswith('encoder.'):
-                            # Remove 'encoder.' prefix to match our module structure
-                            new_key = key[8:]  # len('encoder.') = 8
-                            encoder_weights[new_key] = value
-                        elif not key.startswith('decoder.') and not key.startswith('ctc.'):
-                            # Include other encoder-related weights
-                            encoder_weights[key] = value
+                            new_key = key[8:]  # Remove 'encoder.' prefix
+
+                            # Check if this parameter/buffer exists in our model
+                            if new_key in expected_all:
+                                encoder_weights[new_key] = value
 
                     if encoder_weights:
-                        # Load encoder weights with strict=False to handle any mismatches
                         missing_keys, unexpected_keys = self.speech_encoder.load_state_dict(
                             encoder_weights, strict=False
                         )
                         if missing_keys:
-                            print(f"Missing encoder keys: {missing_keys}")
+                            print(f"Warning: {len(missing_keys)} encoder keys not found in checkpoint")
                         if unexpected_keys:
-                            print(f"Unexpected encoder keys: {unexpected_keys}")
+                            print(f"Warning: {len(unexpected_keys)} unexpected encoder keys in checkpoint")
 
-                # Load adapter/projector weights if available
+                # Load adapter/projector weights from model.pth.tar
                 if model_state_dict and hasattr(self, 'multi_modal_projector'):
-                    # Filter adapter weights
+                    # Get expected parameter names from our multi_modal_projector
+                    expected_params = set(name for name, _ in self.multi_modal_projector.named_parameters())
+
                     adapter_weights = {}
+
+                    # In model.pth.tar, adapter weights have 'encoder_projector.' prefix
                     for key, value in model_state_dict.items():
-                        if key.startswith('adapter.') or key.startswith('projector.'):
-                            # Remove prefix to match our module structure
-                            if key.startswith('adapter.'):
-                                new_key = key[8:]  # len('adapter.') = 8
-                            else:  # projector.
-                                new_key = key[10:]  # len('projector.') = 10
-                            adapter_weights[new_key] = value
+                        if key.startswith('encoder_projector.'):
+                            new_key = key[18:]  # len('encoder_projector.') = 18
+                            if new_key in expected_params:
+                                adapter_weights[new_key] = value
 
                     if adapter_weights:
                         missing_keys, unexpected_keys = self.multi_modal_projector.load_state_dict(
                             adapter_weights, strict=False
                         )
                         if missing_keys:
-                            print(f"Missing adapter keys: {missing_keys}")
+                            print(f"Warning: {len(missing_keys)} adapter keys not found in checkpoint")
                         if unexpected_keys:
-                            print(f"Unexpected adapter keys: {unexpected_keys}")
+                            print(f"Warning: {len(unexpected_keys)} unexpected adapter keys in checkpoint")
 
-                print(f"Successfully loaded FireRedASR checkpoints from {model_path}")
-                if encoder_path:
-                    print(f"Encoder weights loaded from {encoder_path}")
+                # Verify weights were loaded properly
+                weights_ok = self._verify_weights_loaded()
+                if weights_ok:
+                    print(f"Successfully loaded FireRedASR checkpoints from {model_path}")
+                    if encoder_path:
+                        print(f"Encoder weights loaded from {encoder_path}")
+                else:
+                    print(f"Warning: Some weights may not have loaded correctly from {model_path}")
 
             except Exception as e:
                 print(f"Warning: Failed to load FireRedASR checkpoints: {e}")
                 print("Continuing with randomly initialized weights...")
         else:
             print("No FireRedASR checkpoint files found. Using randomly initialized weights.")
+
+    def _verify_weights_loaded(self):
+        """Verify that weights were actually loaded by checking parameter statistics."""
+        # Check encoder weights
+        encoder_loaded = 0
+        encoder_total = 0
+        for name, param in self.speech_encoder.named_parameters():
+            encoder_total += 1
+            if param.abs().max() > 1e-6:  # Has reasonable non-zero values
+                encoder_loaded += 1
+
+        # Check adapter weights
+        adapter_loaded = 0
+        adapter_total = 0
+        for name, param in self.multi_modal_projector.named_parameters():
+            adapter_total += 1
+            if param.abs().max() > 1e-6:
+                adapter_loaded += 1
+
+        # Report results
+        total_loaded = encoder_loaded + adapter_loaded
+        total_params = encoder_total + adapter_total
+        success_rate = (total_loaded / total_params) * 100 if total_params > 0 else 0
+
+        if success_rate < 90:  # Only warn if success rate is low
+            print(f"Warning: Only {success_rate:.1f}% of parameters appear to be loaded correctly")
+
+        return success_rate > 90
 
     def _get_tokenizer(self, vllm_config: VllmConfig):
         """Get the tokenizer for text generation."""
@@ -1632,7 +1708,7 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
         if is_decode_stage:
             # 理论上： original_positions_length 应该等于 current_batch_size (B)
-            positions = positions + 11
+            positions = positions + 51
 
         elif original_positions_length != current_sequence_length:
             # 2. PREFILL 阶段（S' > 1）- 使用之前的裁剪/填充逻辑
