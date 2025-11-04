@@ -3,11 +3,12 @@
 
 """Inference-only FireRedASR LLM model compatible with HuggingFace weights."""
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Annotated, Any, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union, List
 
 import torch
 import torch.nn as nn
 import numpy as np
+import re
 from transformers import BatchFeature
 from typing import List
 from vllm.config import VllmConfig
@@ -1612,21 +1613,8 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
             inputs_embeds = self.get_input_embeddings(input_ids.unsqueeze(0),
                                                       speech_features)
-            # multimodal_embeddings = None
-            # if input_features is not None and feature_lengths is not None:
-            #     speech_features = self.process_audio_features(
-            #         input_features=input_features,
-            #         feature_lengths=feature_lengths
-            #     )
-            #     if isinstance(speech_features, tuple):
-            #         multimodal_embeddings = list(speech_features)
-            #     elif speech_features is not None:
-            #         multimodal_embeddings = [speech_features]
 
-            # inputs_embeds = self.get_input_embeddings(input_ids,
-            #                                           multimodal_embeddings)
             input_ids = None
-
         current_batch_size = inputs_embeds.shape[0] 
         current_sequence_length = inputs_embeds.shape[1] # S'
 
@@ -1662,7 +1650,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                 )
                 positions = torch.cat([positions, padding_positions], dim=0)
 
-
         hidden_states = self.language_model.model(
             input_ids,
             positions,
@@ -1681,47 +1668,28 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         task_type: Literal["transcribe", "translate"],
         request_prompt: str,
         to_language: Optional[str],
+        decode: bool = False,
     ):
-        """Get the generation prompt for FireRedASR model.
-
-        Ensure the text prompt includes the explicit speech placeholder
-        so that tokenization produces `<speech>` tokens aligned with
-        the merge logic.
         """
-        # Import here to avoid import errors if not available
-        try:
-            from vllm.inputs.data import TextPrompt
-        except ImportError:
-            # Fallback to dict if TextPrompt is not available
-            TextPrompt = dict
+        Generate the prompt for FireRedASR model using the input template from the original FireRedASR implementation.
+        This function integrates the template logic from FireRedASR/fireredasr/tokenizer/llm_tokenizer.py
+        """
+        
+        # Clean the request prompt if provided, otherwise use default
+        if request_prompt and request_prompt.strip():
+            clean_text = cls._clean_text(request_prompt.strip())
+            content = f"{DEFAULT_SPEECH_TOKEN}{clean_text}"
+        else:
+            content = f"{DEFAULT_SPEECH_TOKEN}请转写音频为文字"
 
-        # FireRedASR is primarily designed for transcription
-        if task_type == "translate" and to_language is None:
-            raise ValueError("to_language must be specified for translation task")
+        # Create message structure following FireRedASR format
+        messages = [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": "" if decode else ""},
+        ]
 
-        # Build the text prompt based on task type and language
-        # Include speech placeholder token at the head of prompt
-        base_prompt = f"{DEFAULT_SPEECH_TOKEN}请转写音频为文字"
+        base_prompt = cls._manual_template_construction(messages, decode)
 
-        # Add language context if specified
-        if language and language in cls.supported_languages:
-            lang_name = cls.supported_languages[language]
-            base_prompt = f"{DEFAULT_SPEECH_TOKEN}请转写{lang_name}音频为文字"
-
-        # Add translation context if needed
-        if task_type == "translate" and to_language:
-            if to_language in cls.supported_languages:
-                target_lang = cls.supported_languages[to_language]
-                base_prompt = f"{DEFAULT_SPEECH_TOKEN}请将音频翻译为{target_lang}"
-            else:
-                base_prompt = f"Translate the following audio to {to_language}:"
-
-        # Add user's request prompt if provided
-        if request_prompt:
-            base_prompt = f"{DEFAULT_SPEECH_TOKEN}{request_prompt}"
-
-        # Return TextPrompt with audio data
-        # This is correct for Decoder-Only models like FireRedASR
         prompt = {
             "prompt": base_prompt,
             "multi_modal_data": {
@@ -1730,6 +1698,50 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         }
 
         return prompt
+
+    @classmethod
+    def _clean_text(cls, origin_text: str) -> str:
+        """
+        Clean text following the same logic as FireRedASR's LlmTokenizerWrapper.clean_text
+        Remove punctuation, merge spaces, and handle Chinese/English spacing
+        """
+        # Remove punctuation
+        text = re.sub("[，。？！,\\.!?《》（）\\·""、\\/]", "", origin_text)
+        # Merge spaces
+        text = re.sub("\\s+", " ", text)
+
+        # Remove space between Chinese and keep space between English
+        pattern = re.compile(r'([\u3400-\u4dbf\u4e00-\u9fff])')  # Chinese
+        parts = pattern.split(text.strip())
+        parts = [p for p in parts if len(p.strip()) > 0]
+        text = "".join(parts)
+        text = text.strip()
+
+        text = text.lower()
+        return text
+
+    @classmethod
+    def _manual_template_construction(cls, messages, decode: bool = False) -> str:
+        """
+        Manually construct the template when tokenizer.apply_chat_template is not available
+        """
+        result_parts = []
+        for i, message in enumerate(messages):
+            role = message["role"]
+            content = message["content"]
+
+            # Start each message with <|im_start|>role\ncontent
+            result_parts.append(f"<|im_start|>{role}\n{content}")
+
+            # Add ending based on position and decode flag
+            if i == len(messages) - 1:  # Last message
+                if not decode:
+                    result_parts.append("")
+                # For decode mode, don't add anything for the last message
+            else:
+                result_parts.append("<|im_end|>\n")
+
+        return "".join(result_parts)
 
     def forward_audio_only(
         self,
