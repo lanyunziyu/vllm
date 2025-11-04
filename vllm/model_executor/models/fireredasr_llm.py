@@ -11,6 +11,7 @@ import numpy as np
 import re
 from transformers import BatchFeature
 from typing import List
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.config.speech_to_text import SpeechToTextConfig
 from vllm.config import ModelConfig
@@ -115,24 +116,30 @@ class Conv2dSubsampling(nn.Module):
         return x, input_lengths, mask
 
 
-class RelPositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000):
+class RelPositionalEncoding(torch.nn.Module):
+    def __init__(self, d_model, max_len=5000):
         super().__init__()
         pe_positive = torch.zeros(max_len, d_model, requires_grad=False)
         pe_negative = torch.zeros(max_len, d_model, requires_grad=False)
         position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
+                             -(torch.log(torch.tensor(10000.0)).item()/d_model))
         pe_positive[:, 0::2] = torch.sin(position * div_term)
         pe_positive[:, 1::2] = torch.cos(position * div_term)
-        pe_negative[:, 0::2] = torch.sin(-position * div_term)
-        pe_negative[:, 1::2] = torch.cos(-position * div_term)
-        self.pe_positive = pe_positive.unsqueeze(0)
-        self.pe_negative = pe_negative.unsqueeze(0)
+        pe_negative[:, 0::2] = torch.sin(-1 * position * div_term)
+        pe_negative[:, 1::2] = torch.cos(-1 * position * div_term)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        T = x.size(1)
-        pe = self.pe_positive[:, :T, :].to(x.device, dtype=x.dtype)
-        return pe
+        pe_positive = torch.flip(pe_positive, [0]).unsqueeze(0)
+        pe_negative = pe_negative[1:].unsqueeze(0)
+        pe = torch.cat([pe_positive, pe_negative], dim=1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # Tmax = 2 * max_len - 1
+        Tmax, T = self.pe.size(1), x.size(1)
+        pos_emb = self.pe[:, Tmax // 2 - T + 1 : Tmax // 2 + T].clone().detach()
+        return pos_emb
+
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -283,11 +290,15 @@ class ConformerFeedForward(nn.Module):
 
 
 class RelPosEmbConformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, residual_dropout: float = 0.1, dropout_rate: float = 0.1, kernel_size: int = 33):
+    def __init__(self, d_model, n_head,
+                 residual_dropout=0.1,
+                 dropout_rate=0.1, kernel_size=33):
         super().__init__()
         self.ffn1 = ConformerFeedForward(d_model, dropout_rate)
-        self.mhsa = RelPosMultiHeadAttention(n_head, d_model, residual_dropout)
-        self.conv = ConformerConvolution(d_model, kernel_size, dropout_rate)
+        self.mhsa = RelPosMultiHeadAttention(n_head, d_model,
+                                             residual_dropout)
+        self.conv = ConformerConvolution(d_model, kernel_size,
+                                         dropout_rate)
         self.ffn2 = ConformerFeedForward(d_model, dropout_rate)
         self.layer_norm = nn.LayerNorm(d_model)
 
@@ -300,41 +311,51 @@ class RelPosEmbConformerBlock(nn.Module):
         return out
 
 
-class ConformerEncoder(nn.Module):
-    """FireRedASR ConformerEncoder aligned to reference implementation."""
 
-    def __init__(self, input_size: int, num_blocks: int, n_head: int, d_model: int,
-                 residual_dropout: float = 0.1, dropout_rate: float = 0.1,
-                 kernel_size: int = 33, pe_maxlen: int = 5000):
+class ConformerEncoder(nn.Module):
+    def __init__(self, idim, n_layers, n_head, d_model,
+                 residual_dropout=0.1, dropout_rate=0.1, kernel_size=33,
+                 pe_maxlen=5000):
         super().__init__()
         self.odim = d_model
-        self.input_preprocessor = Conv2dSubsampling(input_size, d_model)
-        self.positional_encoding = RelPositionalEncoding(d_model, pe_maxlen)
-        self.dropout = nn.Dropout(residual_dropout)
-        self.layer_stack = nn.ModuleList([
-            RelPosEmbConformerBlock(d_model, n_head, residual_dropout, dropout_rate, kernel_size)
-            for _ in range(num_blocks)
-        ])
 
-    def forward(self, padded_input: torch.Tensor, input_lengths: torch.Tensor, pad: bool = True):
+        self.input_preprocessor = Conv2dSubsampling(idim, d_model)
+        self.positional_encoding = RelPositionalEncoding(d_model)
+        self.dropout = nn.Dropout(residual_dropout)
+
+        self.layer_stack = nn.ModuleList()
+        for l in range(n_layers):
+            block = RelPosEmbConformerBlock(d_model, n_head,
+                        residual_dropout,
+                        dropout_rate, kernel_size)
+            self.layer_stack.append(block)
+
+    def forward(self, padded_input, input_lengths, pad=True):
         if pad:
-            padded_input = nn.functional.pad(
-                padded_input, (0, 0, 0, self.input_preprocessor.context - 1), 'constant', 0.0
-            )
+            padded_input = F.pad(padded_input,
+                (0, 0, 0, self.input_preprocessor.context - 1), 'constant', 0.0)
         src_mask = self.padding_position_is_0(padded_input, input_lengths)
+
         embed_output, input_lengths, src_mask = self.input_preprocessor(padded_input, src_mask)
         enc_output = self.dropout(embed_output)
+
         pos_emb = self.dropout(self.positional_encoding(embed_output))
+
+        enc_outputs = []
         for enc_layer in self.layer_stack:
-            enc_output = enc_layer(enc_output, pos_emb, slf_attn_mask=src_mask, pad_mask=src_mask)
+            enc_output = enc_layer(enc_output, pos_emb, slf_attn_mask=src_mask,
+                                   pad_mask=src_mask)
+            enc_outputs.append(enc_output)
+
         return enc_output, input_lengths, src_mask
 
     def padding_position_is_0(self, padded_input, input_lengths):
         N, T = padded_input.size()[:2]
-        mask = torch.ones((N, T), device=padded_input.device)
+        mask = torch.ones((N, T)).to(padded_input.device)
         for i in range(N):
             mask[i, input_lengths[i]:] = 0
-        return mask.unsqueeze(1).to(torch.uint8)
+        mask = mask.unsqueeze(dim=1)
+        return mask.to(torch.uint8)
 
 
 class FireRedASRAdapter(nn.Module):
@@ -551,7 +572,6 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         audios = mm_data.pop("audios", [])
         if audios:
             mm_data["audio"] = audios
-            
         # For text-only input
         if not mm_data.get("audio", []):
             prompt_ids = self.info.get_tokenizer().encode(prompt)
@@ -572,9 +592,10 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         # Extract Fbank features for each audio
         input_features_list = []
         feature_lengths_list = []
-
+        audios = [audio *  32768 for audio in audios]
         for audio_item in audios:
             # Unpack audio data and sample rate
+            # sample_rate, wav_np = kaldiio.load_mat('/workspace/bella-infra/user/libeibei031/vllm_FrieRedASR/FireRedASR/examples/wav/BAC009S0764W0121.wav')
             if isinstance(audio_item, tuple):
                 audio_data, sample_rate = audio_item
             else:
@@ -584,7 +605,7 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
             # Convert to numpy mono float32 waveform
             if isinstance(audio_data, torch.Tensor):
                 audio_data = audio_data.detach().cpu().numpy()
-            audio_data = np.asarray(audio_data, dtype=np.float32).reshape(-1)
+            # audio_data = np.asarray(audio_data, dtype=np.float32).reshape(-1)
 
             # Resample to 16kHz if needed
             if sample_rate != 16000:
@@ -610,17 +631,6 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
             feats_np = np.vstack(frames)
             feats = torch.from_numpy(feats_np).float()
 
-            # wav = torch.from_numpy(audio_data).float().unsqueeze(0)
-            # feats = torchaudio.compliance.kaldi.fbank(
-            #     wav,
-            #     sample_frequency=16000,
-            #     num_mel_bins=80,
-            #     frame_length=25.0,
-            #     frame_shift=10.0,
-            #     dither=0.0,
-            #     energy_floor=1.0,
-            #     use_energy=False,
-            # )  # (T, 80)
 
 
             # Apply CMVN — global when available, else per-utterance
@@ -998,23 +1008,19 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         # FireRedASR encoder hidden dim：优先使用 d_model，其次 encoder_dim
         encoder_dim = getattr(config, 'encoder_dim', getattr(config, 'd_model', 512))
         llm_dim = getattr(config, 'hidden_size', 3584)  # Qwen2-7B hidden size
-        downsample_rate = getattr(config, 'encoder_downsample_rate', 4)
+        downsample_rate = getattr(config, 'encoder_downsample_rate', 2)
 
         # Speech encoder (Conformer) — 参考实现参数命名
         self.speech_encoder = ConformerEncoder(
-            input_size=getattr(config, 'idim', getattr(config, 'encoder_input_size', 80)),
-            num_blocks=getattr(config, 'n_layers_enc', getattr(config, 'num_encoder_layers', 12)),
-            n_head=getattr(config, 'n_head', 8),
-            d_model=encoder_dim,
-            residual_dropout=getattr(config, 'residual_dropout', 0.1),
-            dropout_rate=getattr(config, 'dropout_rate', getattr(config, 'encoder_dropout_rate', 0.1)),
-            kernel_size=getattr(config, 'kernel_size', 33),
-            pe_maxlen=getattr(config, 'pe_maxlen', 5000),
+            idim=getattr(config, 'idim', getattr(config, 'encoder_input_size', 80)),
+            n_head=20,
+            d_model=1280,
+            n_layers = 16,
         )
 
         # Adapter/Projector
         self.multi_modal_projector = FireRedASRAdapter(
-            encoder_dim, llm_dim, downsample_rate
+            encoder_dim=1280, llm_dim=llm_dim, downsample_rate=downsample_rate
         )
 
         self.quant_config = quant_config
@@ -1615,7 +1621,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                                                       speech_features)
 
             input_ids = None
-        current_batch_size = inputs_embeds.shape[0] 
         current_sequence_length = inputs_embeds.shape[1] # S'
 
         original_positions_length = positions.shape[0]
