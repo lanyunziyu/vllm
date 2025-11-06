@@ -1075,9 +1075,12 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
             tie_word_embeddings=getattr(config, 'tie_word_embeddings', False),
             rope_theta=getattr(config, 'rope_theta', 1000000.0),
             use_sliding_window=getattr(config, 'use_sliding_window', False),
-            sliding_window=getattr(config, 'sliding_window', None),
+            sliding_window=getattr(config, 'sliding_window', 131072),
             max_window_layers=getattr(config, 'max_window_layers', 28),
             attention_dropout=getattr(config, 'attention_dropout', 0.0),
+            bos_token_id=getattr(config, 'bos_token_id', 151643),
+            eos_token_id=getattr(config, 'eos_token_id', 151645),
+            model_type=getattr(config, 'model_type', 'qwen2'),
             
         )
 
@@ -1684,53 +1687,26 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
             # Build multimodal embeddings from provided audio features if any.
             speech_features = None
             if input_features is not None and feature_lengths is not None:
+                seen = False
+                new_input_ids = []
+                for x in input_ids.tolist():
+                    if x == 151646:
+                        if not seen:
+                            new_input_ids.append(x)
+                            seen = True
+                    else:
+                        new_input_ids.append(x)
+                input_ids = torch.tensor(new_input_ids, dtype=input_ids.dtype, device=input_ids.device)
                 speech_features = self.process_audio_features(
                     input_features=input_features,
                     feature_lengths=feature_lengths
                 )
-                if isinstance(speech_features, tuple):
-                    multimodal_embeddings = list(speech_features)
-                elif speech_features is not None:
-                    multimodal_embeddings = [speech_features]
 
             inputs_embeds = self.get_input_embeddings(input_ids.unsqueeze(0),
                                                       speech_features)
 
             input_ids = None
-        current_sequence_length = inputs_embeds.shape[1] # S'
-
-        original_positions_length = positions.shape[0]
-
-        # --- 调试/硬编码区域 ---
-
-        # 1. 判断是否为 DECODE 阶段 (S' == 1)
-        is_decode_stage = (current_sequence_length == 1)
-
-        if is_decode_stage:
-            # 理论上： original_positions_length 应该等于 current_batch_size (B)
-            positions = positions + 51
-
-        elif original_positions_length != current_sequence_length:
-            # 2. PREFILL 阶段（S' > 1）- 使用之前的裁剪/填充逻辑
-            
-            # ... (之前的 Prefill 裁剪/填充逻辑)
-            # 裁剪
-            if original_positions_length > current_sequence_length:
-                positions = positions[:current_sequence_length]
-
-            # 填充
-            elif original_positions_length < current_sequence_length:
-                padding_length = current_sequence_length - original_positions_length
-                start_id = original_positions_length 
-                
-                padding_positions = torch.arange(
-                    start_id,
-                    start_id + padding_length,
-                    dtype=positions.dtype,
-                    device=positions.device
-                )
-                positions = torch.cat([positions, padding_positions], dim=0)
-
+        
         hidden_states = self.language_model.model(
             input_ids,
             positions,
@@ -1759,9 +1735,9 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         # Clean the request prompt if provided, otherwise use default
         if request_prompt and request_prompt.strip():
             clean_text = cls._clean_text(request_prompt.strip())
-            content = f"{DEFAULT_SPEECH_TOKEN}{clean_text}"
+            content = f"{DEFAULT_SPEECH_TOKEN * 52}{clean_text}"
         else:
-            content = f"{DEFAULT_SPEECH_TOKEN}请转写音频为文字"
+            content = f"{DEFAULT_SPEECH_TOKEN * 52}请转写音频为文字"
 
         # Create message structure following FireRedASR format
         messages = [
