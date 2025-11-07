@@ -19,15 +19,17 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.multimodal.inputs import (AudioItem, ModalityData,
                                     MultiModalDataDict, MultiModalFieldConfig,
-                                    MultiModalKwargsItems)
+                                    MultiModalKwargsItems, MultiModalInputs,
+                                    MultiModalEncDecInputs)
 from vllm.multimodal.parse import (AudioProcessorItems, DictEmbeddingItems,
-                                   ModalityDataItems, MultiModalDataItems,
+                                   EmbeddingItems, ModalityDataItems, MultiModalDataItems,
                                    MultiModalDataParser)
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         EncDecMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
                                         PromptUpdate, PromptUpdateDetails,
                                         PromptIndexTargets)
+from vllm.transformers_utils.tokenizer import encode_tokens
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -565,7 +567,7 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
     ) -> Union[str, list[int]]:
         # Use a single dummy token as encoder prompt anchor.
         # This will be replaced by audio placeholders downstream.
-        return [0]
+        return [151646]
 
     def _hf_processor_applies_updates(
         self,
@@ -575,12 +577,125 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         tokenization_kwargs: Mapping[str, object],
     ) -> bool:
         """
-        FireRedASR 的 HF 处理器不直接在 `input_ids` 上展开占位符，
-        我们希望由 vLLM 的通用逻辑来应用 PromptUpdate（根据特征长度展开）。
+        FireRedASR 的 HF 处理器在 `_call_hf_processor` 中已经处理了占位符展开，
+        包括添加缺失的 <speech> token 和计算 audio_token_lengths。
 
-        因此这里强制返回 False，让 `_maybe_apply_prompt_updates` 走手动应用分支。
+        返回 True 表示 HF 处理器已经应用了更新，vLLM 只需要查找现有的占位符位置。
         """
-        return False
+        # 如果有音频数据，说明HF处理器会处理占位符
+        return any(
+            not isinstance(items, (EmbeddingItems, DictEmbeddingItems))
+            for items in mm_items.values()
+        )
+
+    def _get_enc_dec_inputs(
+        self,
+        prompt: Union[str, list[int]],
+        mm_data: MultiModalDataDict,
+        encoder_inputs: MultiModalInputs,
+    ):
+        """
+        FireRedASR的编码-解码输入处理。
+
+        编码器输入：虚拟token（音频特征将直接传递给编码器）
+        解码器输入：包含音频占位符的完整对话模板
+        """
+        tokenizer = self.info.get_tokenizer()
+
+        # 创建解码器提示（包含音频占位符的完整对话模板）
+        decoder_prompt_raw = self.create_decoder_prompt(prompt, mm_data)
+
+        if isinstance(decoder_prompt_raw, str):
+            decoder_prompt_ids = encode_tokens(
+                tokenizer, decoder_prompt_raw, add_special_tokens=False
+            )
+        else:
+            decoder_prompt_ids = decoder_prompt_raw
+
+        # 构建MultiModalEncDecInputs
+        mm_inputs = MultiModalEncDecInputs(
+            encoder_prompt_token_ids=encoder_inputs["prompt_token_ids"],
+            **encoder_inputs
+        )
+
+        # 设置解码器输入
+        mm_inputs["prompt"] = decoder_prompt_raw if isinstance(decoder_prompt_raw, str) else tokenizer.decode(decoder_prompt_raw)
+        # mm_inputs["prompt_token_ids"] = decoder_prompt_ids
+
+        return mm_inputs
+
+    def create_decoder_prompt(
+        self,
+        prompt: Union[str, list[int]],
+        mm_data: MultiModalDataDict,
+    ) -> Union[str, list[int]]:
+        """
+        为FireRedASR创建解码器提示，包含音频占位符的完整对话模板。
+        这与get_generation_prompt中的逻辑保持一致。
+        """
+        # 如果输入已经是token ID列表，直接返回
+        if isinstance(prompt, list):
+            return prompt
+
+        # 清理和处理文本提示
+        if prompt and prompt.strip():
+            clean_text = self._clean_text(prompt.strip())
+            content = f"<speech>{clean_text}"
+        else:
+            content = f"<speech>请转写音频为文字"
+
+        # 创建消息结构（与get_generation_prompt保持一致）
+        messages = [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": ""}
+        ]
+
+        # 使用手动模板构建
+        decoder_prompt = self._manual_template_construction(messages, decode=True)
+        return decoder_prompt
+    
+    def _clean_text(cls, origin_text: str) -> str:
+        """
+        Clean text following the same logic as FireRedASR's LlmTokenizerWrapper.clean_text
+        Remove punctuation, merge spaces, and handle Chinese/English spacing
+        """
+        # Remove punctuation
+        text = re.sub("[，。？！,\\.!?《》（）\\·""、\\/]", "", origin_text)
+        # Merge spaces
+        text = re.sub("\\s+", " ", text)
+
+        # Remove space between Chinese and keep space between English
+        pattern = re.compile(r'([\u3400-\u4dbf\u4e00-\u9fff])')  # Chinese
+        parts = pattern.split(text.strip())
+        parts = [p for p in parts if len(p.strip()) > 0]
+        text = "".join(parts)
+        text = text.strip()
+
+        text = text.lower()
+        return text
+
+    def _manual_template_construction(cls, messages, decode: bool = False) -> str:
+        """
+        Manually construct the template when tokenizer.apply_chat_template is not available
+        """
+        result_parts = []
+        for i, message in enumerate(messages):
+            role = message["role"]
+            content = message["content"]
+
+            # Start each message with <|im_start|>role\ncontent
+            result_parts.append(f"<|im_start|>{role}\n{content}")
+
+            # Add ending based on position and decode flag
+            if i == len(messages) - 1:  # Last message
+                if not decode:
+                    result_parts.append("")
+                # For decode mode, don't add anything for the last message
+            else:
+                result_parts.append("<|im_end|>\n")
+
+        return "".join(result_parts)
+
 
     def _call_hf_processor(
         self,
@@ -622,8 +737,7 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         feature_lengths_list = []
         audios = [audio *  32768 for audio in audios]
         for audio_item in audios:
-            # Unpack audio data and sample rate
-            # sample_rate, wav_np = kaldiio.load_mat('/workspace/bella-infra/user/libeibei031/vllm_FrieRedASR/FireRedASR/examples/wav/BAC009S0764W0121.wav')
+
             if isinstance(audio_item, tuple):
                 audio_data, sample_rate = audio_item
             else:
@@ -658,8 +772,6 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                 feats = torch.zeros((0, opts.mel_opts.num_bins), dtype=torch.float32)
             feats_np = np.vstack(frames)
             feats = torch.from_numpy(feats_np).float()
-
-
 
             # Apply CMVN — global when available, else per-utterance
             try:
@@ -702,10 +814,10 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                 pass
         feature_lengths = torch.tensor(feature_lengths_list, dtype=torch.long)
 
-        # Simple prompt processing - template handling is done in _get_prompt_updates
+
         tokenizer = self.info.get_tokenizer()
         try:
-            # Use a simple text prompt - the template expansion happens in _get_prompt_updates
+            
             prompt_ids = tokenizer.encode("请转写音频为文字", add_special_tokens=False)
         except Exception:
             prompt_ids = tokenizer.encode("请转写音频为文字")
@@ -771,11 +883,12 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         # Precompute expected audio token lengths after downsampling so that
         # prompt updates can match embedding lengths exactly.
         try:
-            ds = self.info.audio_downsample_rate
+            ds = self.info.audio_downsample_rate // 2
         except Exception:
             ds = 4
-        token_lengths_list = [max(1, int(l) // int(ds)) for l in feature_lengths_list]
-        audio_token_lengths = torch.tensor(token_lengths_list, dtype=torch.long)
+        token_lengths_list = (feature_lengths-3)//ds+1 
+        token_lengths_list = (token_lengths_list-3)//ds+1 
+        audio_token_lengths = torch.tensor(token_lengths_list//ds, dtype=torch.long)
 
         return BatchFeature(
             dict(
@@ -867,10 +980,11 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         """Generate prompt updates for FireRedASR."""
 
         out_mm_data = out_mm_kwargs.get_data()
-
+        tokenizer = self.info.get_tokenizer()
+        speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
         def get_replacement_fireredasr(item_idx: int):
             # Get tokenizer for template processing
-            tokenizer = self.info.get_tokenizer()
+           
 
             # Calculate number of audio tokens for this item
             if "audio_token_lengths" in out_mm_data:
@@ -952,13 +1066,7 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                 template_tokens = list(template_tokens) if not isinstance(template_tokens, list) else template_tokens
 
                 # Find the speech token and expand it
-                final_tokens = []
-                for token_id in template_tokens:
-                    if token_id == speech_token_id:
-                        # Replace single <speech> token with num_features speech tokens
-                        final_tokens.extend([speech_token_id] * num_features)
-                    else:
-                        final_tokens.append(token_id)
+                final_tokens = template_tokens + [speech_token_id] * num_features
 
                 return PromptUpdateDetails.select_token_id(
                     final_tokens,
@@ -977,11 +1085,12 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                     embed_token_id=speech_token_id,
                 )
 
-        # 在编码器提示中用一个稳定的锚点 [0]，确保匹配成功
+        # 关键修复：使用token ID列表作为target，避免len()错误
+        speech_token_id = [151646]
         return [
             PromptReplacement(
                 modality="audio",
-                target=[0],
+                target=speech_token_id,  # 使用列表形式的token ID
                 replacement=get_replacement_fireredasr,
             )
         ]
@@ -1525,11 +1634,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
             input_ids != placeholder_id
         )
 
-        # 2. Compute the positions where text should be written
-        # Calculate new positions for text tokens in merged speech-text sequence.
-        # `special_speech_token_mask` identifies speech tokens. Each speech token will be replaced by `nb_text_tokens_per_speechs - 1` text tokens.
-        # `torch.cumsum` computes how each speech token shifts subsequent text token positions.
-        # - 1 to adjust for zero-based indexing, as `cumsum` inherently increases indices by one.
         new_token_positions = (
             torch.cumsum((special_speech_token_mask * (speech_len - 1) + 1), -1) - 1
         )  # (N,U)
@@ -1546,21 +1650,7 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
             dtype=inputs_embeds.dtype,
             device=inputs_embeds.device,
         )
-        # final_attention_mask = torch.zeros(
-        #     batch_size,
-        #     max_embed_dim,
-        #     dtype=attention_mask.dtype,
-        #     device=inputs_embeds.device,
-        # )
-        # if labels is not None:
-        #     final_labels = torch.full(
-        #         (batch_size, max_embed_dim),
-        #         IGNORE_TOKEN_ID,
-        #         dtype=input_ids.dtype,
-        #         device=input_ids.device,
-        #     )
-        # In case the Vision model or the Language model has been offloaded to CPU, we need to manually
-        # set the corresponding tensors into their correct target device.
+
         target_device = inputs_embeds.device
         batch_indices, non_speech_indices, text_to_overwrite = (
             batch_indices.to(target_device),
@@ -1735,9 +1825,9 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         # Clean the request prompt if provided, otherwise use default
         if request_prompt and request_prompt.strip():
             clean_text = cls._clean_text(request_prompt.strip())
-            content = f"{DEFAULT_SPEECH_TOKEN * 52}{clean_text}"
+            content = f"{DEFAULT_SPEECH_TOKEN}{clean_text}"
         else:
-            content = f"{DEFAULT_SPEECH_TOKEN * 52}请转写音频为文字"
+            content = f"{DEFAULT_SPEECH_TOKEN}请转写音频为文字"
 
         # Create message structure following FireRedASR format
         messages = [
@@ -1869,7 +1959,7 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         total_frames = int(audio_duration_s * frames_per_second)
 
         # Apply encoder downsampling (default is 2, but can be configured)
-        downsample_rate = getattr(model_config.hf_config, 'encoder_downsample_rate', 2)
+        downsample_rate = getattr(model_config.hf_config, 'encoder_downsample_rate', 4)
         downsampled_frames = total_frames // downsample_rate
 
         return downsampled_frames
