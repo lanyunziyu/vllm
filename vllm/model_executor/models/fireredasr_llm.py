@@ -41,6 +41,13 @@ from .utils import (AutoWeightsLoader, init_vllm_registered_model,
                     maybe_prefix)
 import os
 
+try:
+    from transformers import Qwen2Config
+except ImportError:
+    # Fallback in case Qwen2Config is not available
+    from transformers import AutoConfig
+    Qwen2Config = AutoConfig
+
 DEFAULT_SPEECH_TOKEN = "<speech>"
 
 
@@ -252,9 +259,9 @@ class RelPosMultiHeadAttention(EncoderMultiHeadAttention):
         q_with_bias_u = (q + self.pos_bias_u.to(q.device)).transpose(1, 2)
         q_with_bias_v = (q + self.pos_bias_v.to(q.device)).transpose(1, 2)
 
-        matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
+        matrix_ac = torch.matmul(q_with_bias_u.to(k.dtype), k.transpose(-2, -1))
 
-        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+        matrix_bd = torch.matmul(q_with_bias_v.to(p.dtype), p.transpose(-2, -1))
         matrix_bd = self._rel_shift(matrix_bd)
 
         attn_scores = matrix_ac + matrix_bd
@@ -605,19 +612,11 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         # 创建解码器提示（包含音频占位符的完整对话模板）
         decoder_prompt_raw = self.create_decoder_prompt(prompt, mm_data)
 
-        if isinstance(decoder_prompt_raw, str):
-            decoder_prompt_ids = encode_tokens(
-                tokenizer, decoder_prompt_raw, add_special_tokens=False
-            )
-        else:
-            decoder_prompt_ids = decoder_prompt_raw
-
         # 构建MultiModalEncDecInputs
         mm_inputs = MultiModalEncDecInputs(
             encoder_prompt_token_ids=encoder_inputs["prompt_token_ids"],
             **encoder_inputs
         )
-
         # 设置解码器输入
         mm_inputs["prompt"] = decoder_prompt_raw if isinstance(decoder_prompt_raw, str) else tokenizer.decode(decoder_prompt_raw)
         # mm_inputs["prompt_token_ids"] = decoder_prompt_ids
@@ -633,68 +632,8 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         为FireRedASR创建解码器提示，包含音频占位符的完整对话模板。
         这与get_generation_prompt中的逻辑保持一致。
         """
-        # 如果输入已经是token ID列表，直接返回
-        if isinstance(prompt, list):
-            return prompt
-
-        # 清理和处理文本提示
-        if prompt and prompt.strip():
-            clean_text = self._clean_text(prompt.strip())
-            content = f"<speech>{clean_text}"
-        else:
-            content = f"<speech>请转写音频为文字"
-
-        # 创建消息结构（与get_generation_prompt保持一致）
-        messages = [
-            {"role": "user", "content": content},
-            {"role": "assistant", "content": ""}
-        ]
-
-        # 使用手动模板构建
-        decoder_prompt = self._manual_template_construction(messages, decode=True)
-        return decoder_prompt
-    
-    def _clean_text(cls, origin_text: str) -> str:
-        """
-        Clean text following the same logic as FireRedASR's LlmTokenizerWrapper.clean_text
-        Remove punctuation, merge spaces, and handle Chinese/English spacing
-        """
-        # Remove punctuation
-        text = re.sub("[，。？！,\\.!?《》（）\\·""、\\/]", "", origin_text)
-        # Merge spaces
-        text = re.sub("\\s+", " ", text)
-
-        # Remove space between Chinese and keep space between English
-        pattern = re.compile(r'([\u3400-\u4dbf\u4e00-\u9fff])')  # Chinese
-        parts = pattern.split(text.strip())
-        parts = [p for p in parts if len(p.strip()) > 0]
-        text = "".join(parts)
-        text = text.strip()
-
-        text = text.lower()
-        return text
-
-    def _manual_template_construction(cls, messages, decode: bool = False) -> str:
-        """
-        Manually construct the template when tokenizer.apply_chat_template is not available
-        """
-        result_parts = []
-        for i, message in enumerate(messages):
-            role = message["role"]
-            content = message["content"]
-
-            # Start each message with <|im_start|>role\ncontent
-            result_parts.append(f"<|im_start|>{role}\n{content}")
-
-            # Add ending based on position and decode flag
-            if i == len(messages) - 1:  # Last message
-                if not decode:
-                    result_parts.append("")
-                # For decode mode, don't add anything for the last message
-            else:
-                result_parts.append("<|im_end|>\n")
-
-        return "".join(result_parts)
+  
+        return prompt
 
 
     def _call_hf_processor(
@@ -747,13 +686,6 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
             # Convert to numpy mono float32 waveform
             if isinstance(audio_data, torch.Tensor):
                 audio_data = audio_data.detach().cpu().numpy()
-            # audio_data = np.asarray(audio_data, dtype=np.float32).reshape(-1)
-
-            # Resample to 16kHz if needed
-            if sample_rate != 16000:
-                audio_tensor = torch.from_numpy(audio_data).unsqueeze(0)
-                audio_tensor = torchaudio.functional.resample(audio_tensor, sample_rate, 16000)
-                audio_data = audio_tensor.squeeze(0).cpu().numpy()
 
             # Compute fbank features — prefer kaldi-native-fbank to match HF
             feats: torch.Tensor
@@ -764,7 +696,7 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
             opts.frame_opts.snip_edges = True
             opts.mel_opts.debug_mel = False
             fbank = knf.OnlineFbank(opts)
-            fbank.accept_waveform(16000, audio_data.tolist())
+            fbank.accept_waveform(sample_rate, audio_data.tolist())
             frames =[]
             for i in range(fbank.num_frames_ready):
                 frames.append(fbank.get_frame(i))
@@ -806,15 +738,7 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
 
         # Stack into batch tensor (B, T, F) then transpose to (B, F, T)
         input_features = torch.stack(padded_features, dim=0).transpose(1, 2)  # (B, F, T)
-        # Debug: optional shape print for alignment
-        if os.environ.get('VLLM_FIRERED_DEBUG', '0') == '1':
-            try:
-                print(f"[FireRedASR] input_features shape: {tuple(input_features.shape)}; feature_lengths: {feature_lengths_list}")
-            except Exception:
-                pass
         feature_lengths = torch.tensor(feature_lengths_list, dtype=torch.long)
-
-
         tokenizer = self.info.get_tokenizer()
         try:
             
@@ -823,72 +747,19 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
             prompt_ids = tokenizer.encode("请转写音频为文字")
         prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
 
-        # Number of audio items provided
-        audio_items = audios
-        if not isinstance(audio_items, list):
-            audio_items = [audio_items]
-        num_audios = len(audio_items)
-
-        # Choose a placeholder string that is actually encodable by the tokenizer
-        def _choose_audio_placeholder_text():
-            candidates = [
-                "<speech>",
-                "<|AUDIO|>",
-                "<|audio|>",
-                "<audio>",
-                "[AUDIO]",
-                "audio",
-            ]
-            for text in candidates:
-                try:
-                    # Prefer candidates that resolve to a non-UNK id
-                    tok_id = tokenizer.convert_tokens_to_ids(text)
-                except Exception:
-                    tok_id = None
-                try:
-                    ids = tokenizer.encode(text, add_special_tokens=False)
-                except TypeError:
-                    ids = tokenizer.encode(text)
-                # Accept only if id is known or ids are non-empty
-                if (tok_id is not None and tok_id != getattr(tokenizer, 'unk_token_id', None)) \
-                        or (isinstance(ids, list) and len(ids) > 0):
-                    return text, ids
-            return None,[]
-
-        placeholder_text, placeholder_ids = _choose_audio_placeholder_text()
-
-        # Count occurrences of a sub-sequence within a sequence
-        def count_subseq(seq: list[int], sub: list[int]) -> int:
-            if not seq or not sub or len(sub) > len(seq):
-                return 0
-            count = 0
-            i = 0
-            L = len(seq)
-            M = len(sub)
-            while i <= L - M:
-                if seq[i:i + M] == sub:
-                    count += 1
-                    i += M
-                else:
-                    i += 1
-            return count
-
-        # If the prompt has fewer placeholders than audios, append the missing ones
-        if num_audios > 0 and placeholder_ids:
-            current = count_subseq(prompt_ids, placeholder_ids)
-            missing = num_audios - current
-            if missing > 0:
-                prompt_ids = prompt_ids + (placeholder_ids * missing)
 
         # Precompute expected audio token lengths after downsampling so that
         # prompt updates can match embedding lengths exactly.
         try:
             ds = self.info.audio_downsample_rate // 2
         except Exception:
-            ds = 4
+            ds = 2
         token_lengths_list = (feature_lengths-3)//ds+1 
         token_lengths_list = (token_lengths_list-3)//ds+1 
-        audio_token_lengths = torch.tensor(token_lengths_list//ds, dtype=torch.long)
+        token_lengths_list = token_lengths_list//ds
+        if feature_lengths % 2 == 1:
+            token_lengths_list = token_lengths_list - 1
+        audio_token_lengths = torch.tensor(token_lengths_list, dtype=torch.long)
 
         return BatchFeature(
             dict(
@@ -984,8 +855,6 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
         def get_replacement_fireredasr(item_idx: int):
             # Get tokenizer for template processing
-           
-
             # Calculate number of audio tokens for this item
             if "audio_token_lengths" in out_mm_data:
                 atl = out_mm_data["audio_token_lengths"]
@@ -1003,35 +872,7 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                 except Exception:
                     value = 1
                 num_features = max(1, value)
-            elif "feature_lengths" in out_mm_data:
-                feature_lengths = out_mm_data["feature_lengths"]
-                downsample_rate = self.info.audio_downsample_rate
-                try:
-                    if isinstance(feature_lengths, torch.Tensor):
-                        if feature_lengths.ndim == 0:
-                            value = int(feature_lengths.item())
-                        else:
-                            value = int(feature_lengths[int(item_idx)].item())
-                        num_features = max(1, value // downsample_rate)
-                    elif isinstance(feature_lengths, (list, tuple)):
-                        value = int(feature_lengths[int(item_idx)])
-                        num_features = max(1, value // downsample_rate)
-                    else:
-                        import numpy as np
-                        if isinstance(feature_lengths, np.ndarray):
-                            value = int(feature_lengths[int(item_idx)])
-                            num_features = max(1, value // downsample_rate)
-                        else:
-                            num_features = 1
-                except Exception:
-                    num_features = 1
-            else:
-                num_features = 100  # Default fallback
-
-            if num_features == 0:
-                num_features = 1  # Minimum fallback
-
-            # Generate FireRedASR-style prompt following the original template
+           
             try:
                 # Ensure <speech> token exists
                 speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
@@ -1048,10 +889,8 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                     {"role": "user", "content": "<speech>请转写音频为文字"},
                     {"role": "assistant", "content": ""}
                 ]
-
                 # Use FireRedASR's decode template for inference
                 TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content']}}{% if loop.last %}{{''}}{% else %}{{ '<|im_end|>\\n' }}{% endif %}{% endfor %}"
-
                 # Generate the template tokens
                 template_tokens = tokenizer.apply_chat_template(
                     messages,
@@ -1143,7 +982,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
         # FireRedASR components
         # FireRedASR encoder hidden dim：优先使用 d_model，其次 encoder_dim
-        encoder_dim = getattr(config, 'encoder_dim', getattr(config, 'd_model', 512))
         llm_dim = getattr(config, 'hidden_size', 3584)  # Qwen2-7B hidden size
         downsample_rate = getattr(config, 'encoder_downsample_rate', 2)
 
@@ -1163,12 +1001,7 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         self.quant_config = quant_config
 
         # Language model (Qwen2) - create a compatible config for the LLM part
-        try:
-            from transformers import Qwen2Config
-        except ImportError:
-            # Fallback in case Qwen2Config is not available
-            from transformers import AutoConfig
-            Qwen2Config = AutoConfig
+
         llm_config = Qwen2Config(
             vocab_size=getattr(config, 'vocab_size', 152064),
             hidden_size=llm_dim,
@@ -1563,9 +1396,9 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
             encoder_out, enc_lengths)
 
         # Split into individual sequences for batch processing
-        speech_features_list = []
-        for i, length in enumerate(speech_lens):
-            speech_features_list.append(speech_features[i, :length])
+        # speech_features_list = []
+        # for i, length in enumerate(speech_lens):
+        #     speech_features_list.append(speech_features[i, :length])
         self.speech_lens = speech_lens
         return speech_features
 
@@ -1796,7 +1629,35 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                                                       speech_features)
 
             input_ids = None
-        
+
+        # --- 调试/硬编码区域 ---
+        current_sequence_length = inputs_embeds.shape[1] # S'
+        original_positions_length = positions.shape[0]
+        # is_decode_stage = (current_sequence_length == 1)
+
+        if original_positions_length != current_sequence_length:
+            if original_positions_length > current_sequence_length:
+                positions = positions[:current_sequence_length]
+            # 填充
+            elif original_positions_length < current_sequence_length:
+                padding_length = current_sequence_length - original_positions_length
+                start_id = original_positions_length 
+                padding_positions = torch.arange(
+                    start_id,
+                    start_id + padding_length,
+                    dtype=positions.dtype,
+                    device=positions.device
+                )
+                positions = torch.cat([positions, padding_positions], dim=0)
+
+        if speech_features is not None:
+            # 动态获取音频特征的最大长度
+            max_audio_len = max(len(f) for f in speech_features) if isinstance(speech_features, (list, tuple)) else speech_features.shape[1]
+            
+            # 设置一个合理的阈值（例如 10000）进行检查
+            if max_audio_len > 10000: 
+                print(f"Warning: Extremely long audio sequence detected: {max_audio_len}")
+                # 在此处实现截断或分块逻辑
         hidden_states = self.language_model.model(
             input_ids,
             positions,
@@ -1890,46 +1751,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
         return "".join(result_parts)
 
-    def forward_audio_only(
-        self,
-        input_features: torch.Tensor,
-        feature_lengths: torch.Tensor,
-        **kwargs
-    ) -> torch.Tensor:
-        """Forward pass for pure ASR (audio-only input)."""
-        # Process audio to get speech embeddings
-        speech_embeddings = self.process_audio_features(
-            input_features=input_features,
-            feature_lengths=feature_lengths
-        )
-
-        # Create minimal input IDs for generation start (BOS token)
-        batch_size = input_features.shape[0]
-        bos_token_id = getattr(self.tokenizer, 'bos_token_id', 1)
-        if bos_token_id is None:
-            bos_token_id = 1  # Fallback BOS token
-        bos_ids = torch.full((batch_size, 1), bos_token_id,
-                            device=input_features.device, dtype=torch.long)
-
-        # Get text embeddings for BOS token and combine with speech
-        # Convert speech_embeddings to MultiModalEmbeddings format
-        multimodal_embeddings = None
-        if speech_embeddings is not None:
-            if isinstance(speech_embeddings, tuple):
-                multimodal_embeddings = list(speech_embeddings)
-            else:
-                multimodal_embeddings = [speech_embeddings]
-
-        inputs_embeds = self.get_input_embeddings(bos_ids, multimodal_embeddings)
-
-        # Pass through language model for text generation
-        hidden_states = self.language_model.model(
-            input_ids=None,
-            positions=None,
-            inputs_embeds=inputs_embeds
-        )
-
-        return hidden_states
 
     def compute_logits(
         self,
@@ -1949,20 +1770,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
             min_energy_split_window_size=1600,  # 100ms at 16kHz for smart chunking
         )
 
-    @classmethod
-    def get_num_audio_tokens(
-        cls, audio_duration_s: float, stt_config: SpeechToTextConfig,
-        model_config: ModelConfig
-    ) -> Optional[int]:
-        # Feature extraction: 10ms frame shift = 100 frames per second
-        frames_per_second = stt_config.sample_rate / 160  # 160 samples per frame (10ms at 16kHz)
-        total_frames = int(audio_duration_s * frames_per_second)
-
-        # Apply encoder downsampling (default is 2, but can be configured)
-        downsample_rate = getattr(model_config.hf_config, 'encoder_downsample_rate', 4)
-        downsampled_frames = total_frames // downsample_rate
-
-        return downsampled_frames
 
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
