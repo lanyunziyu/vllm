@@ -905,7 +905,10 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                 template_tokens = list(template_tokens) if not isinstance(template_tokens, list) else template_tokens
 
                 # Find the speech token and expand it
-                final_tokens = template_tokens + [speech_token_id] * num_features
+                # final_tokens = template_tokens + [speech_token_id] * num_features
+                index_of = template_tokens.index(speech_token_id) + 1
+                template_tokens[index_of:index_of] = [speech_token_id] * num_features
+                final_tokens = template_tokens
 
                 return PromptUpdateDetails.select_token_id(
                     final_tokens,
@@ -1624,8 +1627,11 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                     input_features=input_features,
                     feature_lengths=feature_lengths
                 )
-
-            inputs_embeds = self.get_input_embeddings(input_ids.unsqueeze(0),
+            if speech_features is None:
+                input_ids = input_ids.unsqueeze(0)
+            else:
+                input_ids = input_ids.unsqueeze(0).expand(speech_features.shape[0],-1)
+            inputs_embeds = self.get_input_embeddings(input_ids,
                                                       speech_features)
 
             input_ids = None
@@ -1649,20 +1655,14 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                     device=positions.device
                 )
                 positions = torch.cat([positions, padding_positions], dim=0)
-
-        if speech_features is not None:
-            # 动态获取音频特征的最大长度
-            max_audio_len = max(len(f) for f in speech_features) if isinstance(speech_features, (list, tuple)) else speech_features.shape[1]
-            
-            # 设置一个合理的阈值（例如 10000）进行检查
-            if max_audio_len > 10000: 
-                print(f"Warning: Extremely long audio sequence detected: {max_audio_len}")
-                # 在此处实现截断或分块逻辑
+                
+        positions = positions.unsqueeze(0).expand(inputs_embeds.shape[0],-1).flatten()
+        inputs_embeds=inputs_embeds.reshape(-1,inputs_embeds.shape[-1])
         hidden_states = self.language_model.model(
             input_ids,
             positions,
             intermediate_tensors,
-            inputs_embeds=inputs_embeds.squeeze(0),
+            inputs_embeds=inputs_embeds,
         )
         return hidden_states
 
