@@ -519,7 +519,7 @@ class FireRedASRMultiModalDataParser(MultiModalDataParser):
         return super()._parse_audio_data(data)
 
 
-class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessingInfo]):
+class FireRedASRMultiModalProcessor(BaseMultiModalProcessor[FireRedASRProcessingInfo]):
     """Multimodal processor for FireRedASR model (encoder-decoder interface)."""
 
     def __init__(
@@ -567,73 +567,59 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         # For profiling, pad dummy encoder prompt to match audio token count
         return True
 
-    def create_encoder_prompt(
-        self,
-        prompt: Union[str, list[int]],
-        mm_data: MultiModalDataDict,
-    ) -> Union[str, list[int]]:
-        # Use a single dummy token as encoder prompt anchor.
-        # This will be replaced by audio placeholders downstream.
-        return [151646]
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
+    def _calculate_accurate_token_lengths(self, feature_lengths: torch.Tensor):
         """
-        FireRedASR 的 HF 处理器在 `_call_hf_processor` 中已经处理了占位符展开，
-        包括添加缺失的 <speech> token 和计算 audio_token_lengths。
+        准确计算FireRedASR模型的音频token数量，模拟实际的前向传播过程
 
-        返回 True 表示 HF 处理器已经应用了更新，vLLM 只需要查找现有的占位符位置。
+        处理流程:
+        1. Conv2dSubsampling: 4倍下采样 (两个stride=2的卷积)
+        2. FireRedASRAdapter: 2倍下采样 (可配置的downsample_rate)
+
+        Args:
+            feature_lengths: 原始音频特征长度 [B]
+
+        Returns:
+            最终的音频token长度 [B]
         """
-        # 如果有音频数据，说明HF处理器会处理占位符
-        return any(
-            not isinstance(items, (EmbeddingItems, DictEmbeddingItems))
-            for items in mm_items.values()
-        )
+        batch_size = feature_lengths.shape[0]
+        token_lengths = []
 
-    def _get_enc_dec_inputs(
-        self,
-        prompt: Union[str, list[int]],
-        mm_data: MultiModalDataDict,
-        encoder_inputs: MultiModalInputs,
-    ):
-        """
-        FireRedASR的编码-解码输入处理。
+        for i in range(batch_size):
+            orig_len = int(feature_lengths[i].item())
 
-        编码器输入：虚拟token（音频特征将直接传递给编码器）
-        解码器输入：包含音频占位符的完整对话模板
-        """
-        tokenizer = self.info.get_tokenizer()
+            # 第1步: 模拟ConformerEncoder中的padding
+            # 在forward中会添加context-1=6帧的padding: F.pad(..., (0, 0, 0, 6), ...)
+            padded_len = orig_len + 6  # context-1 = 6
 
-        # 创建解码器提示（包含音频占位符的完整对话模板）
-        decoder_prompt_raw = self.create_decoder_prompt(prompt, mm_data)
+            # 第2步: 模拟Conv2dSubsampling的下采样
+            # Conv2d(kernel=3, stride=2) 两次，总下采样率为4
+            # 参考mask计算: mask = x_mask[:, :, :-2:2][:, :, :-2:2]
 
-        # 构建MultiModalEncDecInputs
-        mm_inputs = MultiModalEncDecInputs(
-            encoder_prompt_token_ids=encoder_inputs["prompt_token_ids"],
-            **encoder_inputs
-        )
-        # 设置解码器输入
-        mm_inputs["prompt"] = decoder_prompt_raw if isinstance(decoder_prompt_raw, str) else tokenizer.decode(decoder_prompt_raw)
-        # mm_inputs["prompt_token_ids"] = decoder_prompt_ids
+            # 第一个卷积层: kernel=3, stride=2
+            # 输出长度 = (input - kernel + 2*padding) // stride + 1
+            # 但这里没有额外padding，所以: (padded_len - 3) // 2 + 1
+            after_conv1 = max(1, (padded_len - 3) // 2 + 1)
 
-        return mm_inputs
+            # 第二个卷积层: kernel=3, stride=2
+            after_conv2 = max(1, (after_conv1 - 3) // 2 + 1)
 
-    def create_decoder_prompt(
-        self,
-        prompt: Union[str, list[int]],
-        mm_data: MultiModalDataDict,
-    ) -> Union[str, list[int]]:
-        """
-        为FireRedASR创建解码器提示，包含音频占位符的完整对话模板。
-        这与get_generation_prompt中的逻辑保持一致。
-        """
-  
-        return prompt
+            # 第3步: 模拟FireRedASRAdapter的下采样
+            # downsample_rate = 2 (默认值，从配置获取)
+            try:
+                # 从配置中获取下采样率
+                ds_rate = self.info.audio_downsample_rate//2
+            except:
+                ds_rate = 2  # 默认值
+
+            # Adapter中的处理:
+            # 1. 丢弃无法整除的帧: seq_len - (seq_len % ds_rate)
+            # 2. 然后下采样: new_len = seq_len // ds_rate
+            usable_len = after_conv2 - (after_conv2 % ds_rate)
+            final_len = max(1, usable_len // ds_rate)
+
+            token_lengths.append(final_len)
+
+        return token_lengths
 
 
     def _call_hf_processor(
@@ -740,26 +726,49 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         input_features = torch.stack(padded_features, dim=0).transpose(1, 2)  # (B, F, T)
         feature_lengths = torch.tensor(feature_lengths_list, dtype=torch.long)
         tokenizer = self.info.get_tokenizer()
-        try:
-            
-            prompt_ids = tokenizer.encode("请转写音频为文字", add_special_tokens=False)
-        except Exception:
-            prompt_ids = tokenizer.encode("请转写音频为文字")
-        prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
 
+        speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
+        if speech_token_id == getattr(tokenizer, 'unk_token_id', None) or speech_token_id is None:
+            try:
+                special_tokens_dict = {"additional_special_tokens": ["<speech>"]}
+                tokenizer.add_special_tokens(special_tokens_dict)
+                speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
+            except Exception:
+                speech_token_id = 151646  # Fallback
 
+        # Create message following FireRedASR template
+        messages = [
+            {"role": "user", "content": "<speech>请转写音频为文字"},
+            {"role": "assistant", "content": ""}
+        ]
+        # Use FireRedASR's decode template for inference
+        TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content']}}{% if loop.last %}{{''}}{% else %}{{ '<|im_end|>\\n' }}{% endif %}{% endfor %}"
+        # Generate the template tokens
+        template_tokens= tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            chat_template=TEMPLATE,
+            add_generation_prompt=False,
+            padding=False,
+        )
+        
         # Precompute expected audio token lengths after downsampling so that
         # prompt updates can match embedding lengths exactly.
-        try:
-            ds = self.info.audio_downsample_rate // 2
-        except Exception:
-            ds = 2
-        token_lengths_list = (feature_lengths-3)//ds+1 
-        token_lengths_list = (token_lengths_list-3)//ds+1 
-        token_lengths_list = token_lengths_list//ds
-        if feature_lengths % 2 == 1:
-            token_lengths_list = token_lengths_list - 1
-        audio_token_lengths = torch.tensor(token_lengths_list, dtype=torch.long)
+        # try:
+        #     ds = self.info.audio_downsample_rate // 2
+        # except Exception:
+        #     ds = 2
+        # token_lengths_list = (feature_lengths-3)//ds+1 
+        # token_lengths_list = (token_lengths_list-3)//ds+1 
+        # token_lengths_list = token_lengths_list//ds
+        # if feature_lengths % 2 == 1:
+        #     token_lengths_list = token_lengths_list - 1
+        audio_token_lengths = self._calculate_accurate_token_lengths(feature_lengths)
+        num_audio_tokens = audio_token_lengths[0]
+        index_of = template_tokens.index(speech_token_id) + 1
+        template_tokens[index_of:index_of] = [speech_token_id] * num_audio_tokens
+        prompt_ids = template_tokens
+        audio_token_lengths = torch.tensor([num_audio_tokens], dtype=torch.long)
 
         return BatchFeature(
             dict(
@@ -872,67 +881,18 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
                 except Exception:
                     value = 1
                 num_features = max(1, value)
-           
-            try:
-                # Ensure <speech> token exists
-                speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
-                if speech_token_id == getattr(tokenizer, 'unk_token_id', None) or speech_token_id is None:
-                    try:
-                        special_tokens_dict = {"additional_special_tokens": ["<speech>"]}
-                        tokenizer.add_special_tokens(special_tokens_dict)
-                        speech_token_id = tokenizer.convert_tokens_to_ids("<speech>")
-                    except Exception:
-                        speech_token_id = 151646  # Fallback
 
-                # Create message following FireRedASR template
-                messages = [
-                    {"role": "user", "content": "<speech>请转写音频为文字"},
-                    {"role": "assistant", "content": ""}
-                ]
-                # Use FireRedASR's decode template for inference
-                TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content']}}{% if loop.last %}{{''}}{% else %}{{ '<|im_end|>\\n' }}{% endif %}{% endfor %}"
-                # Generate the template tokens
-                template_tokens = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    chat_template=TEMPLATE,
-                    add_generation_prompt=False,
-                    padding=False,
-                )
-
-                # The template tokens should already contain the <speech> placeholder
-                # We need to identify where <speech> token is and expand it to num_features tokens
-                template_tokens = list(template_tokens) if not isinstance(template_tokens, list) else template_tokens
-
-                # Find the speech token and expand it
-                # final_tokens = template_tokens + [speech_token_id] * num_features
-                index_of = template_tokens.index(speech_token_id) + 1
-                template_tokens[index_of:index_of] = [speech_token_id] * num_features
-                final_tokens = template_tokens
+                final_tokens = [speech_token_id] * (num_features )
+                # final_tokens = template_tokens
 
                 return PromptUpdateDetails.select_token_id(
                     final_tokens,
                     embed_token_id=speech_token_id,
                 )
-
-            except Exception as e:
-                # Fallback to simple token sequence
-                speech_token_id = 151646  # Safe fallback
-                im_start_id = 151644     # <|im_start|>
-                im_end_id = 151645       # <|im_end|>
-
-                speech_tokens = [speech_token_id] * num_features
-                return PromptUpdateDetails.select_token_id(
-                    [im_start_id] + speech_tokens + [im_end_id],
-                    embed_token_id=speech_token_id,
-                )
-
-        # 关键修复：使用token ID列表作为target，避免len()错误
-        speech_token_id = [151646]
         return [
             PromptReplacement(
                 modality="audio",
-                target=speech_token_id,  # 使用列表形式的token ID
+                target="<speech>",  # 使用列表形式的token ID
                 replacement=get_replacement_fireredasr,
             )
         ]
@@ -977,10 +937,10 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         self.test = False
         # Ensure vLLM treats this model as encoder-decoder for V1 pipeline
         # so that the encoder flow runs and get_multimodal_embeddings is used.
-        try:
-            setattr(self.config, 'is_encoder_decoder', True)
-        except Exception:
-            pass
+        # try:
+        #     setattr(self.config, 'is_encoder_decoder', True)
+        # except Exception:
+        #     pass
         self.multimodal_config = multimodal_config
 
         # FireRedASR components
@@ -1408,13 +1368,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
-    def process_audio_features(self,
-                                 **kwargs: object) -> torch.Tensor:
-        audio_input = self._parse_and_validate_audio_input(**kwargs)
-        if audio_input is None:
-            return []
-        speech_features = self._process_audio_input(audio_input)
-        return speech_features
 
     def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
         """Get multimodal embeddings for audio input."""
@@ -1432,18 +1385,24 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
-        speech_embeddings,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-        if speech_embeddings is not None and len(speech_embeddings) != 0: #
+        new_input_ids = self.remove_duplicate_token_batch(input_ids) 
+        new_input_ids = new_input_ids.unsqueeze(0)
+        inputs_embeds = self.language_model.get_input_embeddings(new_input_ids)
+        if len(multimodal_embeddings)>2:
+            print("test")
+        if multimodal_embeddings is not None and len(multimodal_embeddings) != 0: #
             # placeholder_id = self._get_audio_placeholder_id()
             inputs_embeds = self._merge_input_ids_with_speech_features(
-                speech_features=speech_embeddings,
+                speech_features=torch.stack(multimodal_embeddings),
                 inputs_embeds=inputs_embeds,
-                input_ids=input_ids,
+                input_ids=new_input_ids,
                 speech_lens=self.speech_lens,#self.speech_lens,
             )
-        return inputs_embeds
+        return inputs_embeds.squeeze(0)
 
     def _merge_input_ids_with_speech_features(
         self, speech_features, inputs_embeds, input_ids, labels=None,
@@ -1591,6 +1550,48 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         # Final hard fallback - use a safe token ID that should exist
         return 151646  # Should be the next available ID after <|im_end|>
 
+
+    def remove_duplicate_token_batch(self, input_ids, target_id=151646, pad_token_id=0):
+        is_single = False
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+            is_single = True
+        elif input_ids.dim() > 2:
+            raise ValueError("input_ids 必须是一维或二维张量")
+
+        new_batch = []
+
+        for seq in input_ids:
+            seen = False
+            new_seq = []
+            for token in seq.tolist():
+                if token == target_id:
+                    if not seen:
+                        new_seq.append(token)
+                        seen = True
+                    # 重复的 target_id 跳过
+                else:
+                    new_seq.append(token)
+            new_batch.append(new_seq)
+
+        # 找到最长序列长度
+        max_len = max(len(seq) for seq in new_batch)
+
+        # pad 对齐
+        padded = [
+            seq + [pad_token_id] * (max_len - len(seq))
+            for seq in new_batch
+        ]
+
+        result = torch.tensor(padded, dtype=input_ids.dtype, device=input_ids.device)
+
+        # 如果原始是单序列输入，则还原回一维
+        if is_single:
+            result = result.squeeze(0)
+
+        return result
+
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -1602,62 +1603,31 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         **kwargs: object,
     ) -> Union[torch.Tensor, IntermediateTensors]:
 
-        # In vLLM V1, always merge audio embeddings into inputs_embeds based on
-        # placeholder tokens present in input_ids; do not short-circuit to
-        # audio-only paths that construct their own BOS-only ids, which can
-        # desynchronize positions.
-
         if intermediate_tensors is not None:
             inputs_embeds = None
-        elif inputs_embeds is None and input_ids is not None:
-            # Build multimodal embeddings from provided audio features if any.
-            speech_features = None
-            if input_features is not None and feature_lengths is not None:
-                seen = False
-                new_input_ids = []
-                for x in input_ids.tolist():
-                    if x == 151646:
-                        if not seen:
-                            new_input_ids.append(x)
-                            seen = True
-                    else:
-                        new_input_ids.append(x)
-                input_ids = torch.tensor(new_input_ids, dtype=input_ids.dtype, device=input_ids.device)
-                speech_features = self.process_audio_features(
-                    input_features=input_features,
-                    feature_lengths=feature_lengths
-                )
-            if speech_features is None:
-                input_ids = input_ids.unsqueeze(0)
-            else:
-                input_ids = input_ids.unsqueeze(0).expand(speech_features.shape[0],-1)
-            inputs_embeds = self.get_input_embeddings(input_ids,
-                                                      speech_features)
-
-            input_ids = None
 
         # --- 调试/硬编码区域 ---
-        current_sequence_length = inputs_embeds.shape[1] # S'
-        original_positions_length = positions.shape[0]
-        # is_decode_stage = (current_sequence_length == 1)
+        # current_sequence_length = inputs_embeds.shape[1]# S'
+        # original_positions_length = positions.shape[0]
+        # # is_decode_stage = (current_sequence_length == 1)
 
-        if original_positions_length != current_sequence_length:
-            if original_positions_length > current_sequence_length:
-                positions = positions[:current_sequence_length]
-            # 填充
-            elif original_positions_length < current_sequence_length:
-                padding_length = current_sequence_length - original_positions_length
-                start_id = original_positions_length 
-                padding_positions = torch.arange(
-                    start_id,
-                    start_id + padding_length,
-                    dtype=positions.dtype,
-                    device=positions.device
-                )
-                positions = torch.cat([positions, padding_positions], dim=0)
+        # if original_positions_length != current_sequence_length:
+        #     if original_positions_length > current_sequence_length:
+        #         positions = positions[:current_sequence_length]
+        #     # 填充
+        #     elif original_positions_length < current_sequence_length:
+        #         padding_length = current_sequence_length - original_positions_length
+        #         start_id = original_positions_length 
+        #         padding_positions = torch.arange(
+        #             start_id,
+        #             start_id + padding_length,
+        #             dtype=positions.dtype,
+        #             device=positions.device
+        #         )
+        #         positions = torch.cat([positions, padding_positions], dim=0)
                 
-        positions = positions.unsqueeze(0).expand(inputs_embeds.shape[0],-1).flatten()
-        inputs_embeds=inputs_embeds.reshape(-1,inputs_embeds.shape[-1])
+        # positions = positions.unsqueeze(0).expand(inputs_embeds.shape[0],-1).flatten()
+        # inputs_embeds=inputs_embeds.reshape(-1,inputs_embeds.shape[-1])
         hidden_states = self.language_model.model(
             input_ids,
             positions,
@@ -1704,7 +1674,16 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                 "audio": (audio, stt_config.sample_rate),
             }
         }
-
+        # prompt = {
+        #     "encoder_prompt": {
+        #         # Whisper does not support encoder prompt.
+        #         "prompt": base_prompt,
+        #         "multi_modal_data": {
+        #             "audio": (audio, stt_config.sample_rate),
+        #         },
+        #     },
+        #     "decoder_prompt": "<|im_start|>",
+        # }
         return prompt
 
     @classmethod
