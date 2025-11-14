@@ -1318,16 +1318,19 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         speech_features, speech_lens = self.multi_modal_projector(
             encoder_out, enc_lengths)
 
-        # Split into individual sequences for batch processing
-        # speech_features_list = []
-        # for i, length in enumerate(speech_lens):
-        #     speech_features_list.append(speech_features[i, :length])
         self.speech_lens = speech_lens
         return speech_features
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
+    def process_audio_features(self,
+                                 **kwargs: object) -> torch.Tensor:
+        audio_input = self._parse_and_validate_audio_input(**kwargs)
+        if audio_input is None:
+            return []
+        speech_features = self._process_audio_input(audio_input)
+        return speech_features
 
     def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
         """Get multimodal embeddings for audio input."""
@@ -1354,7 +1357,7 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         multimodal_embeddings: 
             若提供，为长度为 B 的列表，每个元素是当前样本的语音特征列表 [speech_1, speech_2, ...]。
         """
-        batch_size = len(multimodal_embeddings)
+        batch_size = len(multimodal_embeddings) 
         new_input_ids = self.remove_duplicate_token_batch(input_ids)  # 假定支持 batch
         ids_len = len(new_input_ids)
         b_idx = 0
@@ -1526,11 +1529,10 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         # Final hard fallback - use a safe token ID that should exist
         return 151646  # Should be the next available ID after <|im_end|>
 
-
     def remove_duplicate_token_batch(self, input_ids):
         target = 151646
 
-        # —— 1. 压缩连续 target ——
+        # —— 1. 压缩连续 target ——  
         same = (input_ids[1:] == target) & (input_ids[:-1] == target)
         keep = torch.ones_like(input_ids, dtype=torch.bool)
         keep[1:] = ~same
@@ -1565,7 +1567,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
         return segments
 
-
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -1576,6 +1577,7 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         feature_lengths: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+
 
         if intermediate_tensors is not None:
             inputs_embeds = None
@@ -1625,16 +1627,7 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
                 "audio": (audio, stt_config.sample_rate),
             }
         }
-        # prompt = {
-        #     "encoder_prompt": {
-        #         # Whisper does not support encoder prompt.
-        #         "prompt": base_prompt,
-        #         "multi_modal_data": {
-        #             "audio": (audio, stt_config.sample_rate),
-        #         },
-        #     },
-        #     "decoder_prompt": "<|im_start|>",
-        # }
+
         return prompt
 
     @classmethod
