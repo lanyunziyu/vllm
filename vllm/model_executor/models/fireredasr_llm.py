@@ -896,15 +896,8 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         self.config = config
         self.test = False
         # Ensure vLLM treats this model as encoder-decoder for V1 pipeline
-        # so that the encoder flow runs and get_multimodal_embeddings is used.
-        # try:
-        #     setattr(self.config, 'is_encoder_decoder', True)
-        # except Exception:
-        #     pass
         self.multimodal_config = multimodal_config
 
-        # FireRedASR components
-        # FireRedASR encoder hidden dim：优先使用 d_model，其次 encoder_dim
         llm_dim = getattr(config, 'hidden_size', 3584)  # Qwen2-7B hidden size
         downsample_rate = getattr(config, 'encoder_downsample_rate', 2)
 
@@ -960,8 +953,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         self.speech_token_id = getattr(config, 'speech_token_id', None)
         self.tokenizer = self._get_tokenizer(vllm_config)
 
-        # Ensure decoder start token id is set for encoder-decoder preprocessing.
-        # If not provided by the HF config, fall back to tokenizer BOS/EOS or 1.
         try:
             dec_start = getattr(config, 'decoder_start_token_id', None)
         except Exception:
@@ -1486,7 +1477,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
         return final_embedding #, position_ids
 
-
     def _get_audio_placeholder_id(self) -> int:
         """Get the speech token ID following FireRedASR's approach."""
         # Prefer configured speech token id if available
@@ -1531,7 +1521,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
     def remove_duplicate_token_batch(self, input_ids):
         target = 151646
-
         # —— 1. 压缩连续 target ——  
         same = (input_ids[1:] == target) & (input_ids[:-1] == target)
         keep = torch.ones_like(input_ids, dtype=torch.bool)
@@ -1577,7 +1566,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         feature_lengths: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-
 
         if intermediate_tensors is not None:
             inputs_embeds = None
@@ -1674,7 +1662,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
         return "".join(result_parts)
 
-
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1692,8 +1679,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
             overlap_chunk_second=1,  # Overlap between audio chunks
             min_energy_split_window_size=1600,  # 100ms at 16kHz for smart chunking
         )
-
-
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         HF_LLM_CORE_PREFIX = 'model.'
