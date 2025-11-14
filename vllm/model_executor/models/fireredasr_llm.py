@@ -568,52 +568,23 @@ class FireRedASRMultiModalProcessor(BaseMultiModalProcessor[FireRedASRProcessing
         return True
 
     def _calculate_accurate_token_lengths(self, feature_lengths: torch.Tensor):
-        """
-        准确计算FireRedASR模型的音频token数量，模拟实际的前向传播过程
 
-        处理流程:
-        1. Conv2dSubsampling: 4倍下采样 (两个stride=2的卷积)
-        2. FireRedASRAdapter: 2倍下采样 (可配置的downsample_rate)
-
-        Args:
-            feature_lengths: 原始音频特征长度 [B]
-
-        Returns:
-            最终的音频token长度 [B]
-        """
         batch_size = feature_lengths.shape[0]
         token_lengths = []
 
         for i in range(batch_size):
             orig_len = int(feature_lengths[i].item())
 
-            # 第1步: 模拟ConformerEncoder中的padding
-            # 在forward中会添加context-1=6帧的padding: F.pad(..., (0, 0, 0, 6), ...)
             padded_len = orig_len + 6  # context-1 = 6
 
-            # 第2步: 模拟Conv2dSubsampling的下采样
-            # Conv2d(kernel=3, stride=2) 两次，总下采样率为4
-            # 参考mask计算: mask = x_mask[:, :, :-2:2][:, :, :-2:2]
-
-            # 第一个卷积层: kernel=3, stride=2
-            # 输出长度 = (input - kernel + 2*padding) // stride + 1
-            # 但这里没有额外padding，所以: (padded_len - 3) // 2 + 1
             after_conv1 = max(1, (padded_len - 3) // 2 + 1)
 
-            # 第二个卷积层: kernel=3, stride=2
             after_conv2 = max(1, (after_conv1 - 3) // 2 + 1)
-
-            # 第3步: 模拟FireRedASRAdapter的下采样
-            # downsample_rate = 2 (默认值，从配置获取)
             try:
-                # 从配置中获取下采样率
                 ds_rate = self.info.audio_downsample_rate//2
             except:
                 ds_rate = 2  # 默认值
 
-            # Adapter中的处理:
-            # 1. 丢弃无法整除的帧: seq_len - (seq_len % ds_rate)
-            # 2. 然后下采样: new_len = seq_len // ds_rate
             usable_len = after_conv2 - (after_conv2 % ds_rate)
             final_len = max(1, usable_len // ds_rate)
 
@@ -752,17 +723,6 @@ class FireRedASRMultiModalProcessor(BaseMultiModalProcessor[FireRedASRProcessing
             padding=False,
         )
         
-        # Precompute expected audio token lengths after downsampling so that
-        # prompt updates can match embedding lengths exactly.
-        # try:
-        #     ds = self.info.audio_downsample_rate // 2
-        # except Exception:
-        #     ds = 2
-        # token_lengths_list = (feature_lengths-3)//ds+1 
-        # token_lengths_list = (token_lengths_list-3)//ds+1 
-        # token_lengths_list = token_lengths_list//ds
-        # if feature_lengths % 2 == 1:
-        #     token_lengths_list = token_lengths_list - 1
         audio_token_lengths = self._calculate_accurate_token_lengths(feature_lengths)
         num_audio_tokens = audio_token_lengths[0]
         index_of = template_tokens.index(speech_token_id) + 1
@@ -1384,25 +1344,41 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
     def get_input_embeddings(
         self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        input_ids: torch.Tensor,  # [B, seq_len]
+        multimodal_embeddings: list[list[torch.Tensor]] | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        new_input_ids = self.remove_duplicate_token_batch(input_ids) 
-        new_input_ids = new_input_ids.unsqueeze(0)
-        inputs_embeds = self.language_model.get_input_embeddings(new_input_ids)
-        if len(multimodal_embeddings)>2:
-            print("test")
-        if multimodal_embeddings is not None and len(multimodal_embeddings) != 0: #
-            # placeholder_id = self._get_audio_placeholder_id()
-            inputs_embeds = self._merge_input_ids_with_speech_features(
-                speech_features=torch.stack(multimodal_embeddings),
-                inputs_embeds=inputs_embeds,
-                input_ids=new_input_ids,
-                speech_lens=self.speech_lens,#self.speech_lens,
-            )
-        return inputs_embeds.squeeze(0)
+        """
+        支持 batch 输入的多模态 embedding 获取函数
+        multimodal_embeddings: 
+            若提供，为长度为 B 的列表，每个元素是当前样本的语音特征列表 [speech_1, speech_2, ...]。
+        """
+        batch_size = len(multimodal_embeddings)
+        new_input_ids = self.remove_duplicate_token_batch(input_ids)  # 假定支持 batch
+        ids_len = len(new_input_ids)
+        b_idx = 0
+        merged_embeds = []
+        for idx_ids in range(ids_len) :
+            now_input_ids = new_input_ids[idx_ids].unsqueeze(0)
+            inputs_embeds = self.language_model.get_input_embeddings(now_input_ids)  # [B, seq_len, D]
+            if (now_input_ids == 151646).any().item() and b_idx < batch_size:
+                sample_multimodal = multimodal_embeddings[b_idx].unsqueeze(0)
+                merged = self._merge_input_ids_with_speech_features(
+                    speech_features=sample_multimodal,
+                    inputs_embeds=inputs_embeds,
+                    input_ids=now_input_ids,
+                    speech_lens=self.speech_lens,
+                )
+                merged_embeds.append(merged.squeeze(0)) 
+                b_idx = b_idx + 1
+            else :
+                merged_embeds.append(inputs_embeds.squeeze(0))
+
+        merged_embeds = torch.cat(merged_embeds, dim=0)
+        merged_embeds = torch.cat([merged_embeds, merged_embeds.new_zeros(input_ids.size(0) - merged_embeds.size(0), *merged_embeds.shape[1:])], dim=0)
+
+        return  merged_embeds
 
     def _merge_input_ids_with_speech_features(
         self, speech_features, inputs_embeds, input_ids, labels=None,
@@ -1551,45 +1527,43 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
         return 151646  # Should be the next available ID after <|im_end|>
 
 
-    def remove_duplicate_token_batch(self, input_ids, target_id=151646, pad_token_id=0):
-        is_single = False
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-            is_single = True
-        elif input_ids.dim() > 2:
-            raise ValueError("input_ids 必须是一维或二维张量")
+    def remove_duplicate_token_batch(self, input_ids):
+        target = 151646
 
-        new_batch = []
+        # —— 1. 压缩连续 target ——
+        same = (input_ids[1:] == target) & (input_ids[:-1] == target)
+        keep = torch.ones_like(input_ids, dtype=torch.bool)
+        keep[1:] = ~same
+        compact = input_ids[keep]
 
-        for seq in input_ids:
-            seen = False
-            new_seq = []
-            for token in seq.tolist():
-                if token == target_id:
-                    if not seen:
-                        new_seq.append(token)
-                        seen = True
-                    # 重复的 target_id 跳过
-                else:
-                    new_seq.append(token)
-            new_batch.append(new_seq)
+        # —— 2. 分隔符（放到跟 compact 一样的 device） ——  
+        sep = torch.tensor([
+            151644,872,198,151646,14880,46670,61443,
+            111268,17714,87335,151645,198,151644,77091,198
+        ], device=compact.device)
 
-        # 找到最长序列长度
-        max_len = max(len(seq) for seq in new_batch)
+        segments = []
+        cur = []
 
-        # pad 对齐
-        padded = [
-            seq + [pad_token_id] * (max_len - len(seq))
-            for seq in new_batch
-        ]
+        i = 0
+        L = len(sep)
 
-        result = torch.tensor(padded, dtype=input_ids.dtype, device=input_ids.device)
+        # —— 3. 遍历并切分 ——  
+        while i < len(compact):
+            if i + L <= len(compact) and torch.equal(compact[i:i+L], sep):
+                if cur:
+                    segments.append(torch.tensor(cur, device=compact.device))
+                    cur = []
+                segments.append(sep.clone())  # sep 本身已在正确 device 上
+                i += L
+            else:
+                cur.append(int(compact[i]))
+                i += 1
 
-        # 如果原始是单序列输入，则还原回一维
-        if is_single:
-            result = result.squeeze(0)
+        if cur:
+            segments.append(torch.tensor(cur, device=compact.device))
 
-        return result
+        return segments
 
 
     def forward(
@@ -1605,29 +1579,6 @@ class FireRedASRForSpeechToText(nn.Module, SupportsTranscription, SupportsMultiM
 
         if intermediate_tensors is not None:
             inputs_embeds = None
-
-        # --- 调试/硬编码区域 ---
-        # current_sequence_length = inputs_embeds.shape[1]# S'
-        # original_positions_length = positions.shape[0]
-        # # is_decode_stage = (current_sequence_length == 1)
-
-        # if original_positions_length != current_sequence_length:
-        #     if original_positions_length > current_sequence_length:
-        #         positions = positions[:current_sequence_length]
-        #     # 填充
-        #     elif original_positions_length < current_sequence_length:
-        #         padding_length = current_sequence_length - original_positions_length
-        #         start_id = original_positions_length 
-        #         padding_positions = torch.arange(
-        #             start_id,
-        #             start_id + padding_length,
-        #             dtype=positions.dtype,
-        #             device=positions.device
-        #         )
-        #         positions = torch.cat([positions, padding_positions], dim=0)
-                
-        # positions = positions.unsqueeze(0).expand(inputs_embeds.shape[0],-1).flatten()
-        # inputs_embeds=inputs_embeds.reshape(-1,inputs_embeds.shape[-1])
         hidden_states = self.language_model.model(
             input_ids,
             positions,
